@@ -1,0 +1,331 @@
+"""
+Experimental skellycam live source for the FreeMoCap -> GMR bridge.
+
+This module intentionally exposes the same MocapFrame stream shape as
+realtime_mocap_probe.iter_mocap_3d_frames, so the bridge can swap the input
+source without changing the retarget/ZMQ path.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence
+
+import numpy as np
+
+from realtime_mocap_probe import (
+    MocapFrame,
+    _load_camera_group_class,
+    make_trackers,
+    prewarm_triangulation,
+    resize_frames_for_tracking,
+    track_single_camera_frame,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MAX_CAMERA_SKEW_MS = 50.0
+
+
+def choose_skellycam_runtime_home(skellycam_home: Optional[Path] = None) -> Path:
+    candidates = [
+        skellycam_home.expanduser() if skellycam_home is not None else None,
+        Path(os.environ["SKELLYCAM_HOME"]).expanduser() if os.environ.get("SKELLYCAM_HOME") else None,
+        REPO_ROOT / ".venv" / ".skellycam_live_home",
+        Path(tempfile.gettempdir()) / "skellycam_live_home",
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate.resolve()
+        except OSError:
+            continue
+    raise RuntimeError("Could not find a writable runtime directory for skellycam.")
+
+
+def configure_skellycam_runtime_home(skellycam_home: Optional[Path] = None) -> Path:
+    runtime_home = choose_skellycam_runtime_home(skellycam_home)
+    os.environ["SKELLYCAM_HOME"] = str(runtime_home)
+    os.environ["HOME"] = str(runtime_home)
+    os.environ["USERPROFILE"] = str(runtime_home)
+    os.environ.setdefault("YOLO_CONFIG_DIR", str(runtime_home))
+    return runtime_home
+
+
+def _import_skellycam_bits(skellycam_home: Optional[Path] = None) -> tuple[type, type]:
+    configure_skellycam_runtime_home(skellycam_home)
+    from skellycam.opencv.camera.models.camera_config import CameraConfig
+    from skellycam.opencv.group.camera_group import CameraGroup as SkellyCameraGroup
+
+    return SkellyCameraGroup, CameraConfig
+
+
+def parse_camera_ids(camera_ids: Optional[str | Sequence[str]]) -> Optional[List[str]]:
+    if camera_ids is None:
+        return None
+    if isinstance(camera_ids, str):
+        cleaned = [part.strip() for part in camera_ids.split(",")]
+        parsed = [part for part in cleaned if part]
+    else:
+        parsed = [str(part).strip() for part in camera_ids if str(part).strip()]
+    return parsed or None
+
+
+def load_camera_config_json(camera_config_json: Optional[Path]) -> Dict[str, Dict[str, Any]]:
+    if camera_config_json is None:
+        return {}
+    path = camera_config_json.expanduser().resolve()
+    with path.open("r", encoding="utf-8") as file:
+        raw = json.load(file)
+    if not isinstance(raw, dict):
+        raise ValueError("--camera-config-json must contain a JSON object keyed by camera id.")
+    return {str(camera_id): dict(config) for camera_id, config in raw.items()}
+
+
+def _build_camera_config_dictionary(
+    camera_ids: Optional[Sequence[str]],
+    camera_config_json: Optional[Path],
+    camera_config_class: type,
+    expected_camera_count: int,
+) -> tuple[List[str], Dict[str, Any]]:
+    raw_configs = load_camera_config_json(camera_config_json)
+    parsed_camera_ids = parse_camera_ids(camera_ids)
+
+    if raw_configs:
+        config_dictionary = {
+            str(camera_id): camera_config_class(**{**config, "camera_id": str(camera_id)})
+            for camera_id, config in raw_configs.items()
+        }
+        if parsed_camera_ids is None:
+            parsed_camera_ids = [
+                camera_id
+                for camera_id, config in config_dictionary.items()
+                if bool(getattr(config, "use_this_camera", True))
+            ]
+    else:
+        if parsed_camera_ids is None:
+            parsed_camera_ids = [str(index) for index in range(expected_camera_count)]
+        config_dictionary = {
+            camera_id: camera_config_class(camera_id=camera_id)
+            for camera_id in parsed_camera_ids
+        }
+
+    if len(parsed_camera_ids) != expected_camera_count:
+        raise ValueError(
+            f"Camera id count ({len(parsed_camera_ids)}) must match calibration camera count "
+            f"({expected_camera_count}). Pass --camera-ids in calibration order."
+        )
+
+    missing_configs = [camera_id for camera_id in parsed_camera_ids if camera_id not in config_dictionary]
+    if missing_configs:
+        raise ValueError(f"Camera config JSON is missing camera ids: {missing_configs}")
+
+    ordered_config_dictionary = {
+        camera_id: config_dictionary[camera_id].copy(update={"use_this_camera": True})
+        if hasattr(config_dictionary[camera_id], "copy")
+        else config_dictionary[camera_id]
+        for camera_id in parsed_camera_ids
+    }
+    return parsed_camera_ids, ordered_config_dictionary
+
+
+def frames_are_synchronized(frame_payloads: Sequence[Any], max_camera_skew_ms: float) -> bool:
+    timestamps = [getattr(frame, "timestamp_ns", None) for frame in frame_payloads]
+    if any(timestamp is None for timestamp in timestamps):
+        return False
+    timestamp_array = np.asarray(timestamps, dtype=np.float64)
+    if not np.isfinite(timestamp_array).all():
+        return False
+    skew_ms = float((np.max(timestamp_array) - np.min(timestamp_array)) / 1e6)
+    return skew_ms <= max_camera_skew_ms
+
+
+def _payloads_to_frames_and_sizes(frame_payloads: Sequence[Any]) -> tuple[List[np.ndarray], List[tuple[int, int]]]:
+    frames: List[np.ndarray] = []
+    image_sizes: List[tuple[int, int]] = []
+    for payload in frame_payloads:
+        if not bool(getattr(payload, "success", False)):
+            raise ValueError("Received unsuccessful camera frame payload.")
+        image = getattr(payload, "image", None)
+        if image is None:
+            raise ValueError("Received camera frame payload with no image.")
+        if image.ndim < 2:
+            raise ValueError(f"Camera frame image must be at least 2D, got shape {image.shape}.")
+        frames.append(image)
+        image_sizes.append((int(image.shape[1]), int(image.shape[0])))
+    return frames, image_sizes
+
+
+def _drain_latest_frames(camera_group: Any, camera_ids: Sequence[str], max_drain_rounds: int = 200) -> Dict[str, Any]:
+    latest: Dict[str, Any] = {}
+    for _ in range(max_drain_rounds):
+        got_any = False
+        frame_payload_dictionary = camera_group.latest_frames()
+        for camera_id in camera_ids:
+            frame_payload = frame_payload_dictionary.get(camera_id)
+            if frame_payload is not None:
+                latest[camera_id] = frame_payload
+                got_any = True
+        if not got_any:
+            break
+    return latest
+
+
+def _track_and_triangulate_frame_set(
+    frames: Sequence[np.ndarray],
+    image_sizes: Sequence[tuple[int, int]],
+    trackers: Sequence[Any],
+    calibration: Any,
+    tracker: str,
+    resize_width: Optional[int],
+    parallel_camera_tracking: bool,
+    camera_executor: Optional[ThreadPoolExecutor],
+    include_holistic: bool = False,
+) -> tuple[np.ndarray, float]:
+    tracking_frames, tracking_image_sizes, scale_factors = resize_frames_for_tracking(frames, resize_width)
+    if parallel_camera_tracking:
+        if camera_executor is None:
+            raise RuntimeError("camera_executor is required when parallel_camera_tracking=True")
+        per_camera_2d = list(
+            camera_executor.map(
+                track_single_camera_frame,
+                trackers,
+                tracking_frames,
+                tracking_image_sizes,
+                scale_factors,
+            )
+        )
+    else:
+        per_camera_2d = [
+            track_single_camera_frame(tracker_instance, frame, image_size, scale_factor)
+            for tracker_instance, frame, image_size, scale_factor in zip(
+                trackers,
+                tracking_frames,
+                tracking_image_sizes,
+                scale_factors,
+            )
+        ]
+
+    tracked_frame = np.stack(per_camera_2d, axis=0)
+    if tracker == "holistic" and not include_holistic:
+        tracked_frame = tracked_frame[:, :33, :]
+
+    valid_ratio = float(np.isfinite(tracked_frame[..., :2]).all(axis=-1).mean())
+    points_2d = tracked_frame[:, :, :2].reshape(len(image_sizes), -1, 2)
+    points_3d = calibration.triangulate(points_2d, progress=False).reshape(tracked_frame.shape[1], 3)
+    return points_3d.astype(np.float32, copy=False), valid_ratio
+
+
+def iter_skellycam_mocap_3d_frames(
+    calibration_toml: Path,
+    camera_ids: Optional[str | Sequence[str]] = None,
+    camera_config_json: Optional[Path] = None,
+    skellycam_home: Optional[Path] = None,
+    max_frames: Optional[int] = None,
+    model_complexity: int = 1,
+    tracker: str = "pose",
+    static_image_mode: bool = False,
+    parallel_camera_tracking: bool = True,
+    camera_workers: Optional[int] = None,
+    resize_width: Optional[int] = None,
+    include_holistic: bool = False,
+    prewarm: bool = True,
+    max_camera_skew_ms: float = DEFAULT_MAX_CAMERA_SKEW_MS,
+    poll_sleep_s: float = 0.001,
+    skellycam_importer: Callable[[Optional[Path]], tuple[type, type]] = _import_skellycam_bits,
+) -> Iterator[MocapFrame]:
+    if max_frames is not None and max_frames <= 0:
+        raise ValueError("max_frames must be positive when provided")
+    if camera_workers is not None and camera_workers <= 0:
+        raise ValueError("camera_workers must be positive")
+    if resize_width is not None and resize_width <= 0:
+        raise ValueError("resize_width must be positive")
+    if max_camera_skew_ms <= 0:
+        raise ValueError("max_camera_skew_ms must be positive")
+    if tracker not in {"pose", "holistic"}:
+        raise ValueError("tracker must be 'pose' or 'holistic'")
+
+    calibration_toml = calibration_toml.expanduser().resolve()
+    if not calibration_toml.exists():
+        raise FileNotFoundError(f"Calibration TOML not found: {calibration_toml}")
+
+    AniposeCameraGroup = _load_camera_group_class()
+    calibration = AniposeCameraGroup.load(str(calibration_toml))
+    expected_camera_count = len(calibration.cameras)
+    if prewarm:
+        prewarm_triangulation(calibration, num_cameras=expected_camera_count)
+
+    SkellyCameraGroup, CameraConfig = skellycam_importer(skellycam_home)
+    ordered_camera_ids, camera_config_dictionary = _build_camera_config_dictionary(
+        camera_ids=parse_camera_ids(camera_ids),
+        camera_config_json=camera_config_json,
+        camera_config_class=CameraConfig,
+        expected_camera_count=expected_camera_count,
+    )
+
+    trackers = make_trackers(
+        num_cameras=len(ordered_camera_ids),
+        model_complexity=model_complexity,
+        static_image_mode=static_image_mode,
+        tracker_backend=tracker,
+    )
+    camera_executor = None
+    if parallel_camera_tracking:
+        camera_executor = ThreadPoolExecutor(max_workers=camera_workers or len(ordered_camera_ids))
+
+    camera_group = SkellyCameraGroup(
+        camera_ids_list=ordered_camera_ids,
+        camera_config_dictionary=camera_config_dictionary,
+    )
+
+    latest_by_camera: Dict[str, Any] = {}
+    seq = 0
+    try:
+        camera_group.start()
+        while max_frames is None or seq < max_frames:
+            latest_by_camera.update(_drain_latest_frames(camera_group, ordered_camera_ids))
+            if any(camera_id not in latest_by_camera for camera_id in ordered_camera_ids):
+                time.sleep(poll_sleep_s)
+                continue
+
+            ordered_payloads = [latest_by_camera[camera_id] for camera_id in ordered_camera_ids]
+            if not frames_are_synchronized(ordered_payloads, max_camera_skew_ms=max_camera_skew_ms):
+                time.sleep(poll_sleep_s)
+                continue
+
+            frames, image_sizes = _payloads_to_frames_and_sizes(ordered_payloads)
+            points_3d, valid_ratio = _track_and_triangulate_frame_set(
+                frames=frames,
+                image_sizes=image_sizes,
+                trackers=trackers,
+                calibration=calibration,
+                tracker=tracker,
+                resize_width=resize_width,
+                parallel_camera_tracking=parallel_camera_tracking,
+                camera_executor=camera_executor,
+                include_holistic=include_holistic,
+            )
+            yield MocapFrame(
+                seq=seq,
+                timestamp_ns=int(max(float(getattr(payload, "timestamp_ns")) for payload in ordered_payloads)),
+                points_3d=points_3d,
+                valid_2d_point_ratio=valid_ratio,
+            )
+            seq += 1
+    finally:
+        try:
+            camera_group.close()
+        finally:
+            for tracker_instance in trackers:
+                cleanup = getattr(tracker_instance, "cleanup", None)
+                if callable(cleanup):
+                    cleanup()
+            if camera_executor is not None:
+                camera_executor.shutdown(wait=True)
