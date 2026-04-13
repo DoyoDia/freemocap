@@ -22,24 +22,12 @@ from typing import Any, Deque, Dict, List, Optional, Sequence
 
 import numpy as np
 
+from gmr_runtime import ensure_gmr_paths, validate_gmr_runtime
 from realtime_mocap_probe import iter_mocap_3d_frames
 from skellycam_live_source import iter_skellycam_mocap_3d_frames
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def _prepend_local_checkout(relative_path: str) -> None:
-    candidate = REPO_ROOT / relative_path
-    if candidate.exists():
-        candidate_str = str(candidate)
-        if candidate_str not in sys.path:
-            sys.path.insert(0, candidate_str)
-
-
-import sys
-
-_prepend_local_checkout("external/GMR")
-_prepend_local_checkout("external/smplx")
+ensure_gmr_paths(REPO_ROOT)
 
 MEDIAPIPE = {
     "nose": 0,
@@ -512,6 +500,16 @@ def _retarget_worker_main(raw_queue: mp.Queue, result_queue: mp.Queue, worker_co
         return
 
     try:
+        validate_gmr_runtime(
+            Path(worker_config.get("repo_root", REPO_ROOT)),
+            require_mujoco=False,
+            require_patch=True,
+        )
+    except Exception as exc:
+        result_queue.put({"type": "worker_error", "error": f"GMR runtime is not ready: {exc}"})
+        return
+
+    try:
         from general_motion_retargeting import GeneralMotionRetargeting
     except ImportError as exc:
         result_queue.put({"type": "worker_error", "error": f"Failed to import GMR: {exc}"})
@@ -558,13 +556,70 @@ def _retarget_worker_main(raw_queue: mp.Queue, result_queue: mp.Queue, worker_co
             )
 
 
+def _mujoco_viewer_worker_main(
+    qpos_queue: mp.Queue,
+    status_queue: mp.Queue,
+    viewer_config: Dict[str, Any],
+) -> None:
+    try:
+        validate_gmr_runtime(
+            Path(viewer_config.get("repo_root", REPO_ROOT)),
+            require_mujoco=True,
+            require_patch=True,
+        )
+        from general_motion_retargeting import RobotMotionViewer
+
+        viewer = RobotMotionViewer(
+            robot_type=str(viewer_config["robot"]),
+            motion_fps=float(viewer_config["fps"]),
+            transparent_robot=0,
+            record_video=False,
+        )
+        _put_latest(status_queue, {"type": "mujoco_viewer_ready"})
+    except Exception as exc:
+        _put_latest(status_queue, {"type": "mujoco_viewer_error", "error": str(exc)})
+        return
+
+    try:
+        while True:
+            try:
+                qpos_item = qpos_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if qpos_item is None:
+                break
+            try:
+                qpos = np.asarray(qpos_item, dtype=np.float32).reshape(-1)
+                if qpos.shape[0] < 36:
+                    raise ValueError(f"MuJoCo qpos too short: {qpos.shape[0]}")
+                viewer.step(
+                    root_pos=qpos[0:3],
+                    root_rot=_normalize_quat_wxyz(qpos[3:7]),
+                    dof_pos=qpos[7:36],
+                    rate_limit=True,
+                    follow_camera=True,
+                )
+                _put_latest(status_queue, {"type": "mujoco_viewer_frame"})
+            except Exception as exc:
+                _put_latest(status_queue, {"type": "mujoco_viewer_error", "error": str(exc)})
+    finally:
+        try:
+            viewer.close()
+        except Exception:
+            pass
+        _put_latest(status_queue, {"type": "mujoco_viewer_closed"})
+
+
 class FreeMoCapToGMRBridge:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.stop_event = threading.Event()
         self.raw_queue: Optional[mp.Queue] = None
         self.result_queue: Optional[mp.Queue] = None
+        self.mujoco_qpos_queue: Optional[mp.Queue] = None
+        self.mujoco_status_queue: Optional[mp.Queue] = None
         self.retarget_process: Optional[mp.Process] = None
+        self.mujoco_process: Optional[mp.Process] = None
         self.context = None
         self.req_sock = None
         self.rep_sock = None
@@ -585,6 +640,8 @@ class FreeMoCapToGMRBridge:
             "last_valid_2d_ratio": None,
             "latest_seq": None,
             "retarget_age_ms": None,
+            "mujoco_viewer_frames": 0,
+            "mujoco_viewer_errors": 0,
         }
         self._logged_first_mocap_frame = False
         self._logged_calibration_ready = False
@@ -624,6 +681,16 @@ class FreeMoCapToGMRBridge:
                 self.retarget_buffer.popleft()
             self.latest_qpos = qpos.astype(np.float32, copy=True)
             self.latest_retarget_recv_ns = recv_ns
+
+    def _send_qpos_to_mujoco_viewer(self, qpos: np.ndarray) -> None:
+        if self.mujoco_qpos_queue is None:
+            return
+        try:
+            _put_latest(self.mujoco_qpos_queue, qpos.astype(np.float32, copy=True))
+        except Exception as exc:
+            with self.stats_lock:
+                self.stats["mujoco_viewer_errors"] += 1
+            print(f"Warning: could not queue MuJoCo viewer frame: {exc}")
 
     def _get_retarget_frames_snapshot(self) -> List[RetargetedFrame]:
         with self.retarget_buffer_lock:
@@ -762,6 +829,7 @@ class FreeMoCapToGMRBridge:
             if payload_type == "retarget_result":
                 qpos = np.asarray(payload["qpos"], dtype=np.float32).reshape(-1)
                 self._append_retarget_frame(int(payload["recv_ns"]), qpos)
+                self._send_qpos_to_mujoco_viewer(qpos)
                 with self.stats_lock:
                     self.stats["retarget_frames"] += 1
                 if not self._logged_first_retarget_frame:
@@ -877,6 +945,27 @@ class FreeMoCapToGMRBridge:
                 print(f"Warning: control send failed: {exc}")
             self.stop_event.wait(timeout=period_s)
 
+    def _mujoco_status_loop(self) -> None:
+        if self.mujoco_status_queue is None:
+            return
+        while not self.stop_event.is_set():
+            try:
+                payload = self.mujoco_status_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            payload_type = payload.get("type") if isinstance(payload, dict) else None
+            if payload_type == "mujoco_viewer_ready":
+                print("MuJoCo viewer ready")
+            elif payload_type == "mujoco_viewer_frame":
+                with self.stats_lock:
+                    self.stats["mujoco_viewer_frames"] += 1
+            elif payload_type == "mujoco_viewer_error":
+                with self.stats_lock:
+                    self.stats["mujoco_viewer_errors"] += 1
+                print(f"Warning: MuJoCo viewer failed: {payload.get('error')}")
+            elif payload_type == "mujoco_viewer_closed":
+                print("MuJoCo viewer closed")
+
     def _stats_loop(self) -> None:
         if float(self.args.log_interval_s) <= 0.0:
             return
@@ -903,6 +992,7 @@ class FreeMoCapToGMRBridge:
                 f"mocap_frames={stats['mocap_frames']}, retarget_frames={stats['retarget_frames']}, "
                 f"requests={stats['requests']}, replies={stats['replies']}, "
                 f"errors={stats['retarget_errors']}, retarget_age_ms={stats['retarget_age_ms']}, "
+                f"viewer_frames={stats['mujoco_viewer_frames']}, viewer_errors={stats['mujoco_viewer_errors']}, "
                 f"valid_2d={valid_msg}, latest_seq={stats['latest_seq']}"
             )
 
@@ -918,6 +1008,7 @@ class FreeMoCapToGMRBridge:
                 self.raw_queue,
                 self.result_queue,
                 {
+                    "repo_root": str(REPO_ROOT),
                     "actual_human_height": float(self.args.actual_human_height),
                     "gmr_max_iter": int(self.args.gmr_max_iter),
                     "mock_gmr": bool(self.args.mock_gmr),
@@ -934,6 +1025,25 @@ class FreeMoCapToGMRBridge:
             raise RuntimeError("GMR retarget worker did not become ready in time.") from exc
         if not isinstance(worker_msg, dict) or worker_msg.get("type") != "worker_ready":
             raise RuntimeError(f"GMR retarget worker failed to start: {worker_msg}")
+
+        if bool(self.args.mujoco_viewer):
+            self.mujoco_qpos_queue = mp_context.Queue(maxsize=1)
+            self.mujoco_status_queue = mp_context.Queue(maxsize=8)
+            self.mujoco_process = mp_context.Process(
+                target=_mujoco_viewer_worker_main,
+                args=(
+                    self.mujoco_qpos_queue,
+                    self.mujoco_status_queue,
+                    {
+                        "repo_root": str(REPO_ROOT),
+                        "robot": str(self.args.mujoco_robot),
+                        "fps": float(self.args.mujoco_fps),
+                    },
+                ),
+                name="freemocap-mujoco-viewer",
+                daemon=True,
+            )
+            self.mujoco_process.start()
 
         self.context = zmq.Context.instance()
         self.req_sock = self.context.socket(zmq.PULL)
@@ -961,6 +1071,9 @@ class FreeMoCapToGMRBridge:
         print(f"  actual_human_height: {self.args.actual_human_height}")
         print(f"  gmr_max_iter: {self.args.gmr_max_iter}")
         print(f"  mock_gmr: {self.args.mock_gmr}")
+        print(f"  mujoco_viewer: {self.args.mujoco_viewer}")
+        print(f"  mujoco_robot: {self.args.mujoco_robot}")
+        print(f"  mujoco_fps: {self.args.mujoco_fps}")
         print(f"  dataset_joint_names: {len(DATASET_JOINT_NAMES_29)} joints")
 
     def run(self) -> None:
@@ -969,6 +1082,7 @@ class FreeMoCapToGMRBridge:
             threading.Thread(target=self._result_loop, name="freemocap-retarget-results", daemon=True),
             threading.Thread(target=self._request_loop, name="freemocap-zmq-requests", daemon=True),
             threading.Thread(target=self._control_loop, name="freemocap-zmq-control", daemon=True),
+            threading.Thread(target=self._mujoco_status_loop, name="freemocap-mujoco-status", daemon=True),
             threading.Thread(target=self._stats_loop, name="freemocap-stats", daemon=True),
         ]
         for thread in threads:
@@ -992,11 +1106,21 @@ class FreeMoCapToGMRBridge:
                 self.raw_queue.put_nowait(None)
             except Exception:
                 pass
+        if self.mujoco_qpos_queue is not None:
+            try:
+                _put_latest(self.mujoco_qpos_queue, None)
+            except Exception:
+                pass
         if self.retarget_process is not None:
             self.retarget_process.join(timeout=2.0)
             if self.retarget_process.is_alive():
                 self.retarget_process.terminate()
                 self.retarget_process.join(timeout=1.0)
+        if self.mujoco_process is not None:
+            self.mujoco_process.join(timeout=2.0)
+            if self.mujoco_process.is_alive():
+                self.mujoco_process.terminate()
+                self.mujoco_process.join(timeout=1.0)
         for sock in (self.req_sock, self.rep_sock, self.ctrl_sock):
             if sock is not None:
                 sock.close(0)
@@ -1024,6 +1148,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--actual-human-height", type=float, default=1.6)
     parser.add_argument("--gmr-max-iter", type=int, default=5)
     parser.add_argument("--mock-gmr", action="store_true")
+    parser.add_argument("--mujoco-viewer", action="store_true")
+    parser.add_argument("--mujoco-fps", type=float, default=30.0)
+    parser.add_argument("--mujoco-robot", type=str, default="unitree_g1")
     parser.add_argument("--req-bind-addr", type=str, default="tcp://*:28701")
     parser.add_argument("--rep-bind-addr", type=str, default="tcp://*:28702")
     parser.add_argument("--ctrl-bind-addr", type=str, default="tcp://*:28703")
@@ -1053,6 +1180,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--ctrl-fps must be positive")
     if args.reply_fps <= 0:
         raise ValueError("--reply-fps must be positive")
+    if args.mujoco_fps <= 0:
+        raise ValueError("--mujoco-fps must be positive")
     if args.max_reply_frames <= 0:
         raise ValueError("--max-reply-frames must be positive")
     if args.retarget_buffer_window_s <= 0:

@@ -158,3 +158,10 @@ freemocap/system/gui_state.json
 .nuxt
 /tauri-nuxt-vue/.idea/
 dist-electron/
+
+
+
+#custom
+freemocap_data/
+/external/smplx/
+/.tmp_pytest*/

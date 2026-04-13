@@ -10,6 +10,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import freemocap_to_gmr_bridge as bridge
+import gmr_runtime
 
 
 def _synthetic_mediapipe_points() -> np.ndarray:
@@ -107,3 +108,47 @@ def test_mock_gmr_worker_emits_retarget_result() -> None:
     finally:
         raw_queue.put(None)
         worker.join(timeout=2.0)
+
+
+def test_put_latest_drops_stale_queue_items() -> None:
+    latest_queue: queue.Queue = queue.Queue(maxsize=1)
+
+    bridge._put_latest(latest_queue, "old")
+    bridge._put_latest(latest_queue, "new")
+
+    assert latest_queue.get_nowait() == "new"
+    assert latest_queue.empty()
+
+
+def test_gmr_runtime_patch_state_detects_missing_and_patched(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(gmr_runtime, "_scipy_supports_scalar_first", lambda: False)
+    motion_retarget = tmp_path / "external" / "GMR" / "general_motion_retargeting" / "motion_retarget.py"
+    neck_retarget = tmp_path / "external" / "GMR" / "general_motion_retargeting" / "neck_retarget.py"
+    motion_retarget.parent.mkdir(parents=True)
+    motion_retarget.write_text("R.from_quat(quat, scalar_first=True)\n", encoding="utf-8")
+    neck_retarget.write_text("R.from_quat(quat, scalar_first=True)\n", encoding="utf-8")
+
+    assert gmr_runtime.gmr_scipy_patch_state(tmp_path) == "missing"
+
+    motion_retarget.write_text("def _rotation_from_quat_wxyz(quat):\n    return quat\n", encoding="utf-8")
+    neck_retarget.write_text("def _rotation_from_quat_wxyz(quat):\n    return quat\n", encoding="utf-8")
+
+    assert gmr_runtime.gmr_scipy_patch_state(tmp_path) == "patched"
+
+
+def test_gmr_runtime_can_load_unitree_g1_mujoco_model() -> None:
+    import pytest
+
+    try:
+        status = gmr_runtime.validate_gmr_runtime(bridge.REPO_ROOT, require_mujoco=True)
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    import mujoco as mj
+
+    model = mj.MjModel.from_xml_path(str(status.unitree_g1_xml))
+    data = mj.MjData(model)
+    data.qpos[:36] = bridge.DEFAULT_QPOS_G1
+    mj.mj_forward(model, data)
+
+    assert model.nq >= 36

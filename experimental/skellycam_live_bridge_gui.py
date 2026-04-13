@@ -69,6 +69,8 @@ TRANSLATIONS = {
         "human_height": "人体身高",
         "model_complexity": "模型复杂度",
         "parallel_tracking": "并行相机 2D 识别",
+        "mujoco_viewer": "MuJoCo 可视化",
+        "mujoco_fps": "MuJoCo FPS",
         "max_camera_skew": "相机最大时间差 ms",
         "request_bind": "请求地址",
         "reply_bind": "回复地址",
@@ -117,6 +119,8 @@ TRANSLATIONS = {
         "human_height": "Human height",
         "model_complexity": "Model complexity",
         "parallel_tracking": "Parallel camera tracking",
+        "mujoco_viewer": "MuJoCo viewer",
+        "mujoco_fps": "MuJoCo FPS",
         "max_camera_skew": "Max camera skew ms",
         "request_bind": "Request bind",
         "reply_bind": "Reply bind",
@@ -323,6 +327,18 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._parallel_tracking_checkbox.setChecked(True)
         form.addRow("", self._parallel_tracking_checkbox)
 
+        self._mujoco_viewer_checkbox = QCheckBox()
+        self._mujoco_viewer_checkbox.setChecked(True)
+        form.addRow("", self._mujoco_viewer_checkbox)
+
+        self._mujoco_fps_label = QLabel()
+        self._mujoco_fps_spin = QDoubleSpinBox()
+        self._mujoco_fps_spin.setRange(1.0, 120.0)
+        self._mujoco_fps_spin.setDecimals(1)
+        self._mujoco_fps_spin.setSingleStep(5.0)
+        self._mujoco_fps_spin.setValue(30.0)
+        form.addRow(self._mujoco_fps_label, self._mujoco_fps_spin)
+
         self._max_camera_skew_label = QLabel()
         self._max_camera_skew_spin = QDoubleSpinBox()
         self._max_camera_skew_spin.setRange(1.0, 500.0)
@@ -388,6 +404,8 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._human_height_label.setText(self._tr("human_height"))
         self._model_complexity_label.setText(self._tr("model_complexity"))
         self._parallel_tracking_checkbox.setText(self._tr("parallel_tracking"))
+        self._mujoco_viewer_checkbox.setText(self._tr("mujoco_viewer"))
+        self._mujoco_fps_label.setText(self._tr("mujoco_fps"))
         self._max_camera_skew_label.setText(self._tr("max_camera_skew"))
         self._request_bind_label.setText(self._tr("request_bind"))
         self._reply_bind_label.setText(self._tr("reply_bind"))
@@ -577,6 +595,14 @@ class SkellycamLiveBridgeLauncher(QWidget):
         ]
         if self._parallel_tracking_checkbox.isChecked():
             args.append("--parallel-camera-tracking")
+        if self._mujoco_viewer_checkbox.isChecked():
+            args.extend(
+                [
+                    "--mujoco-viewer",
+                    "--mujoco-fps",
+                    str(self._mujoco_fps_spin.value()),
+                ]
+            )
 
         self._bridge_process = QProcess(self)
         self._bridge_process.setWorkingDirectory(str(REPO_ROOT))
