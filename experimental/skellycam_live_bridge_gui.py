@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 
 from skellycam_live_source import configure_skellycam_runtime_home
 from gmr_runtime import validate_gmr_runtime
+from skellycam_preview_latency_patch import install_latest_frame_preview_patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_HOME = configure_skellycam_runtime_home(REPO_ROOT / ".venv" / ".skellycam_live_gui_home")
@@ -56,7 +57,7 @@ TRANSLATIONS = {
         "charuco_square_size": "Charuco 方格边长 (mm)",
         "charuco_board": "Charuco 板型",
         "groundplane": "用初始 Charuco 板作为地面原点",
-        "annotate_charuco": "预览时叠加 Charuco 检测",
+        "annotate_charuco": "预览叠加 Charuco 检测（切换后可能需要重连相机）",
         "record_calibration": "开始录制标定视频",
         "stop_calibration": "停止录制标定视频",
         "run_calibration": "运行 FreeMoCap 标定",
@@ -107,7 +108,7 @@ TRANSLATIONS = {
         "charuco_square_size": "Charuco square size (mm)",
         "charuco_board": "Charuco board",
         "groundplane": "Use initial Charuco board as groundplane origin",
-        "annotate_charuco": "Overlay Charuco detection in preview",
+        "annotate_charuco": "Overlay Charuco detection in preview (may need reconnect)",
         "record_calibration": "Start Calibration Recording",
         "stop_calibration": "Stop Calibration Recording",
         "run_calibration": "Run FreeMoCap Calibration",
@@ -202,6 +203,13 @@ class SkellycamLiveBridgeLauncher(QWidget):
 
         self._layout = QHBoxLayout()
         self.setLayout(self._layout)
+
+        patch_installed = install_latest_frame_preview_patch()
+        print(
+            "skellycam latest-frame preview patch installed"
+            if patch_installed
+            else "skellycam latest-frame preview patch already installed"
+        )
 
         self._camera_viewer = SkellyCamWidget(
             get_new_synchronized_videos_folder_callable=self._get_synchronized_videos_folder,
