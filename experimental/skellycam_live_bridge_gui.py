@@ -493,9 +493,14 @@ class SkellycamLiveBridgeLauncher(QWidget):
 
     def _validate_bridge_runtime(self) -> bool:
         try:
+            # Importing MuJoCo inside the long-lived Qt preview process can fail on
+            # some Windows setups with WinError 1114 even though the bridge child
+            # process can launch the viewer successfully. Preflight only the GMR
+            # package + patch here and let the bridge/mujoco worker perform the
+            # actual MuJoCo import check in its own process.
             validate_gmr_runtime(
                 REPO_ROOT,
-                require_mujoco=self._mujoco_viewer_checkbox.isChecked(),
+                require_mujoco=False,
                 require_patch=True,
             )
         except Exception as exc:
