@@ -647,6 +647,16 @@ class FreeMoCapToGMRBridge:
         self._logged_calibration_ready = False
         self._logged_first_retarget_frame = False
 
+    def _validate_runtime_prerequisites(self) -> None:
+        needs_gmr_runtime = bool(self.args.mujoco_viewer) or not bool(self.args.mock_gmr)
+        if not needs_gmr_runtime:
+            return
+        validate_gmr_runtime(
+            REPO_ROOT,
+            require_mujoco=bool(self.args.mujoco_viewer),
+            require_patch=True,
+        )
+
     @staticmethod
     def _default_controller_buttons(start: bool = False) -> Dict[str, Any]:
         return {
@@ -998,6 +1008,8 @@ class FreeMoCapToGMRBridge:
 
     def setup(self) -> None:
         import zmq
+
+        self._validate_runtime_prerequisites()
 
         mp_context = mp.get_context("spawn")
         self.raw_queue = mp_context.Queue(maxsize=1)

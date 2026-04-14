@@ -136,6 +136,26 @@ def test_gmr_runtime_patch_state_detects_missing_and_patched(monkeypatch, tmp_pa
     assert gmr_runtime.gmr_scipy_patch_state(tmp_path) == "patched"
 
 
+def test_validate_gmr_runtime_import_error_mentions_install_command(monkeypatch, tmp_path: Path) -> None:
+    gmr_root = tmp_path / "external" / "GMR"
+    unitree_xml = gmr_root / "assets" / "unitree_g1" / "g1_mocap_29dof.xml"
+    unitree_xml.parent.mkdir(parents=True)
+    unitree_xml.write_text("<mujoco/>", encoding="utf-8")
+
+    import pytest
+
+    original_import_module = gmr_runtime.importlib.import_module
+
+    def _fake_import_module(name: str):
+        if name == "general_motion_retargeting":
+            raise ImportError("boom")
+        return original_import_module(name)
+
+    monkeypatch.setattr(gmr_runtime.importlib, "import_module", _fake_import_module)
+    with pytest.raises(RuntimeError, match="python -m pip install -e external/GMR"):
+        gmr_runtime.validate_gmr_runtime(tmp_path, require_mujoco=False, require_patch=False)
+
+
 def test_gmr_runtime_can_load_unitree_g1_mujoco_model() -> None:
     import pytest
 

@@ -86,13 +86,20 @@ def validate_gmr_runtime(
     try:
         importlib.import_module("general_motion_retargeting")
     except ImportError as exc:
-        raise RuntimeError(f"Failed to import general_motion_retargeting from {gmr_root}: {exc}") from exc
+        raise RuntimeError(
+            f"Failed to import general_motion_retargeting from {gmr_root}: {exc}. "
+            "Install the package into the active environment with "
+            "'python -m pip install -e external/GMR'."
+        ) from exc
 
     if require_mujoco:
         try:
             importlib.import_module("mujoco")
         except ImportError as exc:
-            raise RuntimeError(f"Failed to import mujoco: {exc}") from exc
+            raise RuntimeError(
+                f"Failed to import mujoco: {exc}. Install it into the active environment before "
+                "starting the MuJoCo viewer."
+            ) from exc
 
     unitree_g1_xml = gmr_root / "assets" / "unitree_g1" / "g1_mocap_29dof.xml"
     if not unitree_g1_xml.exists():

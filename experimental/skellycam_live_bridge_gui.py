@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from skellycam_live_source import configure_skellycam_runtime_home
+from gmr_runtime import validate_gmr_runtime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_HOME = configure_skellycam_runtime_home(REPO_ROOT / ".venv" / ".skellycam_live_gui_home")
@@ -95,6 +96,7 @@ TRANSLATIONS = {
         "calibration_started": "开始运行 FreeMoCap 标定：{path}",
         "calibration_finished": "标定完成：{path}",
         "groundplane_failed": "地面原点标定失败：{message}",
+        "runtime_not_ready": "GMR / MuJoCo 运行时环境未就绪：{error}",
     },
     "en": {
         "window_title": "Skellycam Live FreeMoCap -> GMR Bridge",
@@ -145,6 +147,7 @@ TRANSLATIONS = {
         "calibration_started": "Starting FreeMoCap calibration: {path}",
         "calibration_finished": "Calibration finished: {path}",
         "groundplane_failed": "Groundplane calibration failed: {message}",
+        "runtime_not_ready": "GMR/MuJoCo runtime is not ready: {error}",
     },
 }
 
@@ -478,6 +481,18 @@ class SkellycamLiveBridgeLauncher(QWidget):
         with self._camera_config_json_path.open("w", encoding="utf-8") as file:
             json.dump(configs, file, indent=2)
 
+    def _validate_bridge_runtime(self) -> bool:
+        try:
+            validate_gmr_runtime(
+                REPO_ROOT,
+                require_mujoco=self._mujoco_viewer_checkbox.isChecked(),
+                require_patch=True,
+            )
+        except Exception as exc:
+            self._append_log(self._tr("runtime_not_ready", error=str(exc)))
+            return False
+        return True
+
     def _start_calibration_recording(self) -> None:
         if self._bridge_process is not None:
             self._append_log(self._tr("bridge_running_block_calibration"))
@@ -557,6 +572,8 @@ class SkellycamLiveBridgeLauncher(QWidget):
         camera_ids = self._selected_camera_ids(configs)
         if not camera_ids:
             self._append_log(self._tr("no_cameras_selected"))
+            return
+        if not self._validate_bridge_runtime():
             return
 
         self._write_camera_config_json(configs)
