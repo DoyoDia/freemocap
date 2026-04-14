@@ -91,6 +91,7 @@ TRANSLATIONS = {
         "bridge_running_block_calibration": "实时桥正在运行。请先停止实时桥，再录制标定视频。",
         "cameras_not_connected": "相机还没有连接。请先点击 skellycam 的 Detect Available Cameras。",
         "calibration_recording_started": "开始录制标定视频：{path}",
+        "calibration_overlay_paused": "录制标定视频时已临时关闭 Charuco 预览叠加，避免把叠加标记写进视频。",
         "calibration_recording_stopped": "标定录制已停止，正在保存同步视频...",
         "calibration_videos_saved": "标定视频已保存：{path}",
         "no_calibration_videos": "还没有可标定的视频。请先录制并等待保存完成。",
@@ -143,6 +144,7 @@ TRANSLATIONS = {
         "bridge_running_block_calibration": "Bridge is running. Stop it before recording calibration videos.",
         "cameras_not_connected": "Cameras are not connected. Click skellycam's Detect Available Cameras first.",
         "calibration_recording_started": "Started calibration recording: {path}",
+        "calibration_overlay_paused": "Temporarily disabled Charuco preview overlay while recording calibration videos so overlays are not written into the videos.",
         "calibration_recording_stopped": "Calibration recording stopped; saving synchronized videos...",
         "calibration_videos_saved": "Calibration videos saved: {path}",
         "no_calibration_videos": "No calibration videos are ready. Record and wait for saving first.",
@@ -202,6 +204,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._active_calibration_recording_folder: Optional[Path] = None
         self._active_calibration_videos_folder: Optional[Path] = None
         self._next_recording_folder: Optional[Path] = None
+        self._restore_annotate_charuco_after_recording: Optional[bool] = None
 
         self._layout = QHBoxLayout()
         self.setLayout(self._layout)
@@ -270,6 +273,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._charuco_board_label = QLabel()
         self._charuco_board_combo = QComboBox()
         self._charuco_board_combo.addItems(list(CHARUCO_BOARDS.keys()))
+        self._charuco_board_combo.currentTextChanged.connect(self._set_preview_charuco_board)
         form.addRow(self._charuco_board_label, self._charuco_board_combo)
 
         self._groundplane_checkbox = QCheckBox()
@@ -439,6 +443,17 @@ class SkellycamLiveBridgeLauncher(QWidget):
         if worker is not None:
             worker.annotate_images = checked
 
+    def _set_preview_charuco_board(self, board_name: str) -> None:
+        worker = getattr(self._camera_viewer, "_cam_group_frame_worker", None)
+        if worker is None:
+            return
+        skellycam_board_name = {
+            "7x5 Charuco": "Full Charuco (7x5)",
+            "5x3 Charuco": "Mini Charuco (5x3)",
+        }.get(board_name)
+        if skellycam_board_name is not None and hasattr(worker, "charuco_board"):
+            worker.charuco_board = skellycam_board_name
+
     def _cameras_connected(self) -> bool:
         try:
             return bool(self._camera_viewer.cameras_connected)
@@ -522,7 +537,12 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._next_recording_folder = recording_folder
         self._active_recording_value_label.setText(str(recording_folder))
         self._run_calibration_button.setEnabled(False)
-        self._set_annotate_charuco(self._annotate_charuco_checkbox.isChecked())
+        self._set_preview_charuco_board(self._charuco_board_combo.currentText())
+        self._restore_annotate_charuco_after_recording = self._annotate_charuco_checkbox.isChecked()
+        self._annotate_charuco_checkbox.setEnabled(False)
+        if self._restore_annotate_charuco_after_recording:
+            self._annotate_charuco_checkbox.setChecked(False)
+            self._append_log(self._tr("calibration_overlay_paused"))
 
         self._camera_viewer.controller_slot_dictionary["start_recording"]()
         self._start_calibration_recording_button.setEnabled(False)
@@ -534,6 +554,10 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._stop_calibration_recording_button.setEnabled(False)
         self._start_calibration_recording_button.setEnabled(True)
         self._next_recording_folder = None
+        if self._restore_annotate_charuco_after_recording:
+            self._annotate_charuco_checkbox.setChecked(True)
+        self._annotate_charuco_checkbox.setEnabled(True)
+        self._restore_annotate_charuco_after_recording = None
         self._append_log(self._tr("calibration_recording_stopped"))
 
     def _handle_videos_saved(self, folder_path: str) -> None:
