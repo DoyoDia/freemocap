@@ -13,9 +13,9 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
-from PySide6.QtCore import QProcess, Qt
+from PySide6.QtCore import QProcess, Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -40,11 +40,13 @@ from skellycam_preview_latency_patch import install_latest_frame_preview_patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_HOME = configure_skellycam_runtime_home(REPO_ROOT / ".venv" / ".skellycam_live_gui_home")
+GUI_SETTINGS_PATH = RUNTIME_HOME / "live_bridge_gui_settings.json"
+GUI_SETTINGS_VERSION = 1
 
 from freemocap.core_processes.capture_volume_calibration.charuco_stuff.charuco_board_definition import CHARUCO_BOARDS
 from freemocap.gui.qt.workers.anipose_calibration_thread_worker import AniposeCalibrationThreadWorker
 
-from skellycam import SkellyCamParameterTreeWidget, SkellyCamWidget
+from skellycam import CameraConfig, SkellyCamParameterTreeWidget, SkellyCamWidget
 
 
 TRANSLATIONS = {
@@ -58,6 +60,8 @@ TRANSLATIONS = {
         "charuco_board": "Charuco 板型",
         "groundplane": "用初始 Charuco 板作为地面原点",
         "annotate_charuco": "预览叠加 Charuco 检测（切换后可能需要重连相机）",
+        "auto_fast_connect": "启动时快速连接上次相机",
+        "fast_connect": "快速连接上次相机",
         "record_calibration": "开始录制标定视频",
         "stop_calibration": "停止录制标定视频",
         "run_calibration": "运行 FreeMoCap 标定",
@@ -90,6 +94,12 @@ TRANSLATIONS = {
         "bridge_finished": "实时桥进程已结束。",
         "bridge_running_block_calibration": "实时桥正在运行。请先停止实时桥，再录制标定视频。",
         "cameras_not_connected": "相机还没有连接。请先点击 skellycam 的 Detect Available Cameras。",
+        "settings_loaded": "已读取上次配置：{path}",
+        "settings_saved": "已保存 GUI 配置：{path}",
+        "settings_save_failed": "保存 GUI 配置失败：{error}",
+        "fast_connect_no_config": "还没有上次相机配置。请先 Detect Available Cameras 并 Apply 一次。",
+        "fast_connect_started": "正在用上次配置快速连接相机：{camera_ids}",
+        "fast_connect_failed": "快速连接上次相机失败：{error}",
         "calibration_recording_started": "开始录制标定视频：{path}",
         "calibration_overlay_paused": "录制标定视频时已临时关闭 Charuco 预览叠加，避免把叠加标记写进视频。",
         "calibration_recording_stopped": "标定录制已停止，正在保存同步视频...",
@@ -111,6 +121,8 @@ TRANSLATIONS = {
         "charuco_board": "Charuco board",
         "groundplane": "Use initial Charuco board as groundplane origin",
         "annotate_charuco": "Overlay Charuco detection in preview (may need reconnect)",
+        "auto_fast_connect": "Fast-connect last cameras on startup",
+        "fast_connect": "Fast Connect Last Cameras",
         "record_calibration": "Start Calibration Recording",
         "stop_calibration": "Stop Calibration Recording",
         "run_calibration": "Run FreeMoCap Calibration",
@@ -143,6 +155,12 @@ TRANSLATIONS = {
         "bridge_finished": "Bridge process finished.",
         "bridge_running_block_calibration": "Bridge is running. Stop it before recording calibration videos.",
         "cameras_not_connected": "Cameras are not connected. Click skellycam's Detect Available Cameras first.",
+        "settings_loaded": "Loaded previous settings: {path}",
+        "settings_saved": "Saved GUI settings: {path}",
+        "settings_save_failed": "Could not save GUI settings: {error}",
+        "fast_connect_no_config": "No saved camera config yet. Detect cameras and apply settings once first.",
+        "fast_connect_started": "Fast-connecting cameras from previous config: {camera_ids}",
+        "fast_connect_failed": "Fast connect failed: {error}",
         "calibration_recording_started": "Started calibration recording: {path}",
         "calibration_overlay_paused": "Temporarily disabled Charuco preview overlay while recording calibration videos so overlays are not written into the videos.",
         "calibration_recording_stopped": "Calibration recording stopped; saving synchronized videos...",
@@ -163,6 +181,12 @@ def _model_to_dict(model) -> dict:
     if hasattr(model, "dict"):
         return model.dict()
     return dict(model)
+
+
+def _set_combo_text(combo: QComboBox, text: str) -> None:
+    index = combo.findText(text)
+    if index >= 0:
+        combo.setCurrentIndex(index)
 
 
 def _find_default_calibration_toml() -> Optional[Path]:
@@ -205,6 +229,9 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._active_calibration_videos_folder: Optional[Path] = None
         self._next_recording_folder: Optional[Path] = None
         self._restore_annotate_charuco_after_recording: Optional[bool] = None
+        self._loaded_settings: dict[str, Any] = {}
+        self._loaded_camera_configs: dict[str, dict[str, Any]] = {}
+        self._loading_settings = False
 
         self._layout = QHBoxLayout()
         self.setLayout(self._layout)
@@ -221,7 +248,9 @@ class SkellycamLiveBridgeLauncher(QWidget):
             parent=self,
         )
         self._camera_viewer.videos_saved_to_this_folder_signal.connect(self._handle_videos_saved)
+        self._camera_viewer.camera_group_created_signal.connect(self._handle_camera_group_created)
         self._camera_config_tree = SkellyCamParameterTreeWidget(self._camera_viewer)
+        self._camera_config_tree.emitting_camera_configs_signal.connect(self._handle_camera_configs_changed)
 
         self._left_column = QVBoxLayout()
         self._camera_hint_label = QLabel()
@@ -239,6 +268,8 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._build_bridge_controls()
         self._build_log_view()
         self._apply_language()
+        self._load_gui_settings()
+        QTimer.singleShot(0, self._auto_fast_connect_if_enabled)
 
     def _tr(self, key: str, **kwargs) -> str:
         template = TRANSLATIONS.get(self._language, TRANSLATIONS["zh"]).get(key, key)
@@ -284,6 +315,14 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._annotate_charuco_checkbox.toggled.connect(self._set_annotate_charuco)
         self._set_annotate_charuco(self._annotate_charuco_checkbox.isChecked())
         form.addRow("", self._annotate_charuco_checkbox)
+
+        self._auto_fast_connect_checkbox = QCheckBox()
+        self._auto_fast_connect_checkbox.setChecked(False)
+        form.addRow("", self._auto_fast_connect_checkbox)
+
+        self._fast_connect_button = QPushButton()
+        self._fast_connect_button.clicked.connect(self._fast_connect_last_cameras)
+        form.addRow("", self._fast_connect_button)
 
         button_row = QHBoxLayout()
         self._start_calibration_recording_button = QPushButton()
@@ -406,6 +445,8 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._charuco_board_label.setText(self._tr("charuco_board"))
         self._groundplane_checkbox.setText(self._tr("groundplane"))
         self._annotate_charuco_checkbox.setText(self._tr("annotate_charuco"))
+        self._auto_fast_connect_checkbox.setText(self._tr("auto_fast_connect"))
+        self._fast_connect_button.setText(self._tr("fast_connect"))
         self._start_calibration_recording_button.setText(self._tr("record_calibration"))
         self._stop_calibration_recording_button.setText(self._tr("stop_calibration"))
         self._run_calibration_button.setText(self._tr("run_calibration"))
@@ -436,6 +477,178 @@ class SkellycamLiveBridgeLauncher(QWidget):
     def _handle_language_changed(self, *_args) -> None:
         self._language = self._language_combo.currentData() or "zh"
         self._apply_language()
+        if not self._loading_settings:
+            self._save_gui_settings()
+
+    def _handle_camera_group_created(self, camera_configs: Dict[str, Any]) -> None:
+        self._loaded_camera_configs = {
+            str(camera_id): _model_to_dict(config)
+            for camera_id, config in camera_configs.items()
+        }
+
+    def _handle_camera_configs_changed(self, camera_configs: Dict[str, Any]) -> None:
+        self._loaded_camera_configs = {
+            str(camera_id): _model_to_dict(config)
+            for camera_id, config in camera_configs.items()
+        }
+        self._save_gui_settings()
+
+    def _load_gui_settings(self) -> None:
+        try:
+            if not GUI_SETTINGS_PATH.exists():
+                return
+            with GUI_SETTINGS_PATH.open("r", encoding="utf-8") as file:
+                settings = json.load(file)
+        except Exception as exc:
+            self._append_log(f"Could not load GUI settings: {exc}")
+            return
+
+        settings_loaded = False
+        self._loading_settings = True
+        try:
+            self._loaded_settings = settings
+            self._loaded_camera_configs = {
+                str(camera_id): config
+                for camera_id, config in settings.get("camera_configs", {}).items()
+                if isinstance(config, dict)
+            }
+
+            language = settings.get("language")
+            if language in {"zh", "en"}:
+                index = self._language_combo.findData(language)
+                if index >= 0:
+                    self._language_combo.setCurrentIndex(index)
+
+            calibration_toml = settings.get("calibration_toml")
+            if calibration_toml:
+                self._calibration_line_edit.setText(str(calibration_toml))
+            self._camera_ids_line_edit.setText(str(settings.get("camera_ids", "")))
+
+            charuco_square_size = settings.get("charuco_square_size")
+            if charuco_square_size is not None:
+                self._charuco_square_size_spin.setValue(float(charuco_square_size))
+            _set_combo_text(self._charuco_board_combo, str(settings.get("charuco_board", "")))
+            self._groundplane_checkbox.setChecked(bool(settings.get("groundplane", False)))
+            self._annotate_charuco_checkbox.setChecked(bool(settings.get("annotate_charuco", True)))
+            self._auto_fast_connect_checkbox.setChecked(bool(settings.get("auto_fast_connect", False)))
+
+            self._human_height_spin.setValue(float(settings.get("human_height", self._human_height_spin.value())))
+            self._model_complexity_spin.setValue(int(settings.get("model_complexity", self._model_complexity_spin.value())))
+            self._parallel_tracking_checkbox.setChecked(bool(settings.get("parallel_tracking", True)))
+            self._mujoco_viewer_checkbox.setChecked(bool(settings.get("mujoco_viewer", True)))
+            self._mujoco_fps_spin.setValue(float(settings.get("mujoco_fps", self._mujoco_fps_spin.value())))
+            self._max_camera_skew_spin.setValue(float(settings.get("max_camera_skew_ms", self._max_camera_skew_spin.value())))
+            self._req_addr_line_edit.setText(str(settings.get("req_bind_addr", self._req_addr_line_edit.text())))
+            self._rep_addr_line_edit.setText(str(settings.get("rep_bind_addr", self._rep_addr_line_edit.text())))
+            self._ctrl_addr_line_edit.setText(str(settings.get("ctrl_bind_addr", self._ctrl_addr_line_edit.text())))
+            settings_loaded = True
+        except Exception as exc:
+            self._append_log(f"Could not load GUI settings: {exc}")
+        finally:
+            self._loading_settings = False
+
+        if settings_loaded:
+            self._append_log(self._tr("settings_loaded", path=GUI_SETTINGS_PATH))
+
+    def _collect_gui_settings(self) -> dict[str, Any]:
+        camera_configs = self._extract_camera_configs()
+        if not camera_configs:
+            camera_configs = self._loaded_camera_configs
+        return {
+            "version": GUI_SETTINGS_VERSION,
+            "language": self._language,
+            "calibration_toml": self._calibration_line_edit.text().strip(),
+            "camera_ids": self._camera_ids_line_edit.text().strip(),
+            "charuco_square_size": self._charuco_square_size_spin.value(),
+            "charuco_board": self._charuco_board_combo.currentText(),
+            "groundplane": self._groundplane_checkbox.isChecked(),
+            "annotate_charuco": self._annotate_charuco_checkbox.isChecked(),
+            "auto_fast_connect": self._auto_fast_connect_checkbox.isChecked(),
+            "human_height": self._human_height_spin.value(),
+            "model_complexity": self._model_complexity_spin.value(),
+            "parallel_tracking": self._parallel_tracking_checkbox.isChecked(),
+            "mujoco_viewer": self._mujoco_viewer_checkbox.isChecked(),
+            "mujoco_fps": self._mujoco_fps_spin.value(),
+            "max_camera_skew_ms": self._max_camera_skew_spin.value(),
+            "req_bind_addr": self._req_addr_line_edit.text().strip(),
+            "rep_bind_addr": self._rep_addr_line_edit.text().strip(),
+            "ctrl_bind_addr": self._ctrl_addr_line_edit.text().strip(),
+            "camera_configs": camera_configs,
+        }
+
+    def _save_gui_settings(self, log_success: bool = False) -> None:
+        try:
+            settings = self._collect_gui_settings()
+            GUI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with GUI_SETTINGS_PATH.open("w", encoding="utf-8") as file:
+                json.dump(settings, file, ensure_ascii=False, indent=2)
+            self._loaded_settings = settings
+            self._loaded_camera_configs = settings.get("camera_configs", {})
+            if log_success:
+                self._append_log(self._tr("settings_saved", path=GUI_SETTINGS_PATH))
+        except Exception as exc:
+            self._append_log(self._tr("settings_save_failed", error=exc))
+
+    def _saved_camera_ids(self) -> list[str]:
+        raw = self._camera_ids_line_edit.text().strip() or str(self._loaded_settings.get("camera_ids", "")).strip()
+        if raw:
+            return [part.strip() for part in raw.split(",") if part.strip()]
+        return [
+            camera_id
+            for camera_id, config in self._loaded_camera_configs.items()
+            if bool(config.get("use_this_camera", True))
+        ]
+
+    def _saved_camera_config_models(self, camera_ids: list[str]) -> dict[str, CameraConfig]:
+        output: dict[str, CameraConfig] = {}
+        for camera_id in camera_ids:
+            config = dict(self._loaded_camera_configs.get(str(camera_id), {}))
+            config["camera_id"] = str(camera_id)
+            output[str(camera_id)] = CameraConfig(**config)
+        return output
+
+    def _auto_fast_connect_if_enabled(self) -> None:
+        if self._auto_fast_connect_checkbox.isChecked():
+            self._fast_connect_last_cameras()
+
+    def _fast_connect_last_cameras(self) -> None:
+        camera_ids = self._saved_camera_ids()
+        if not camera_ids:
+            self._append_log(self._tr("fast_connect_no_config"))
+            return
+
+        try:
+            if self._cameras_connected():
+                self._camera_viewer.disconnect_from_cameras()
+            camera_configs = self._saved_camera_config_models(camera_ids)
+            worker = getattr(self._camera_viewer, "_cam_group_frame_worker")
+            worker.annotate_images = self._annotate_charuco_checkbox.isChecked()
+            worker._camera_ids = camera_ids
+            worker._camera_group = worker._create_camera_group(
+                camera_ids=camera_ids,
+                camera_config_dictionary=camera_configs,
+            )
+            worker._video_recorder_dictionary = worker._initialize_video_recorder_dictionary()
+
+            self._camera_viewer._clear_camera_grid_view(
+                getattr(self._camera_viewer, "_dictionary_of_single_camera_view_widgets", None)
+            )
+            self._camera_viewer._detect_available_cameras_push_button.hide()
+            self._camera_viewer._dictionary_of_single_camera_view_widgets = (
+                self._camera_viewer._create_camera_view_widgets_and_add_them_to_grid_layout(
+                    camera_config_dictionary=worker.camera_config_dictionary
+                )
+            )
+            try:
+                worker.new_image_signal.disconnect(self._camera_viewer._handle_image_update)
+            except (RuntimeError, TypeError):
+                pass
+            worker.new_image_signal.connect(self._camera_viewer._handle_image_update)
+            worker.start()
+            self._set_preview_charuco_board(self._charuco_board_combo.currentText())
+            self._append_log(self._tr("fast_connect_started", camera_ids=",".join(camera_ids)))
+        except Exception as exc:
+            self._append_log(self._tr("fast_connect_failed", error=exc))
 
     def _set_annotate_charuco(self, checked: bool) -> None:
         self._camera_viewer.annotate_images = checked
@@ -477,6 +690,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         )
         if selected:
             self._calibration_line_edit.setText(selected)
+            self._save_gui_settings()
 
     def _extract_camera_configs(self) -> Dict[str, dict]:
         try:
@@ -530,6 +744,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         if not self._cameras_connected():
             self._append_log(self._tr("cameras_not_connected"))
             return
+        self._save_gui_settings()
 
         recording_folder = _create_live_calibration_recording_folder()
         self._active_calibration_recording_folder = recording_folder
@@ -570,6 +785,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._active_calibration_videos_folder = videos_folder
         self._active_recording_value_label.setText(str(self._active_calibration_recording_folder))
         self._run_calibration_button.setEnabled(True)
+        self._save_gui_settings()
         self._append_log(self._tr("calibration_videos_saved", path=videos_folder))
 
     def _run_calibration(self) -> None:
@@ -597,6 +813,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
     def _handle_calibration_finished(self, toml_path: str) -> None:
         self._calibration_line_edit.setText(toml_path)
         self._run_calibration_button.setEnabled(True)
+        self._save_gui_settings()
         self._append_log(self._tr("calibration_finished", path=toml_path))
 
     def _handle_calibration_failed(self, message: str) -> None:
@@ -620,6 +837,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         if not self._validate_bridge_runtime():
             return
 
+        self._save_gui_settings(log_success=True)
         self._write_camera_config_json(configs)
         try:
             self._camera_viewer.disconnect_from_cameras()
@@ -714,6 +932,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._log_view.appendPlainText(text)
 
     def closeEvent(self, event) -> None:
+        self._save_gui_settings()
         self._stop_bridge()
         self._kill_thread_event.set()
         try:
