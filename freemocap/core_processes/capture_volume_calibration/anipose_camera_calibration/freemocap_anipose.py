@@ -1865,15 +1865,23 @@ class CameraGroup:
     ):
         assert len(all_rows) == len(self.cameras), "Number of camera detections does not match number of cameras"
 
-        for rows, camera in zip(all_rows, self.cameras):
+        min_corners_for_intrinsics = 7
+        for camera_index, (rows, camera) in enumerate(zip(all_rows, self.cameras)):
             size = camera.get_size()
 
             assert size is not None, "Camera with name {} has no specified frame size".format(camera.get_name())
 
             if init_intrinsics:
                 objp, imgp = board.get_all_calibration_points(rows)
-                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= 7]
+                mixed = [(o, i) for (o, i) in zip(objp, imgp) if len(o) >= min_corners_for_intrinsics]
                 assert len(objp) != 0 and len(imgp) != 0, "No Charuco board points detected"
+                if len(mixed) == 0:
+                    max_corners = max((len(row["corners"]) for row in rows), default=0)
+                    raise ValueError(
+                        f"Camera {camera_index} ({camera.get_name()}) has {len(rows)} Charuco frames, "
+                        f"but none have at least {min_corners_for_intrinsics} corners. "
+                        f"Maximum detected corners in one frame: {max_corners}."
+                    )
                 objp, imgp = zip(*mixed)
                 matrix = cv2.initCameraMatrix2D(objp, imgp, tuple(size))
                 camera.set_camera_matrix(matrix)
@@ -1934,6 +1942,46 @@ class CameraGroup:
 
         return all_rows
 
+    def _validate_charuco_rows_for_calibration(self, all_rows, min_corners: int = 7, min_cameras: int = 2):
+        usable_frames_by_camera = []
+        summary_lines = []
+        for camera_index, rows in enumerate(all_rows):
+            usable_frames = {
+                row["framenum"][1]
+                for row in rows
+                if len(row.get("corners", [])) >= min_corners
+            }
+            max_corners = max((len(row.get("corners", [])) for row in rows), default=0)
+            usable_frames_by_camera.append(usable_frames)
+            summary_lines.append(
+                f"Camera {camera_index}: {len(rows)} frames with any corners, "
+                f"{len(usable_frames)} frames with >= {min_corners} corners, max corners {max_corners}"
+            )
+
+        empty_camera_indices = [
+            camera_index
+            for camera_index, usable_frames in enumerate(usable_frames_by_camera)
+            if len(usable_frames) == 0
+        ]
+        frame_visibility_counts = {}
+        for usable_frames in usable_frames_by_camera:
+            for frame_number in usable_frames:
+                frame_visibility_counts[frame_number] = frame_visibility_counts.get(frame_number, 0) + 1
+        shared_frame_count = sum(
+            1
+            for visibility_count in frame_visibility_counts.values()
+            if visibility_count >= min_cameras
+        )
+
+        if empty_camera_indices or shared_frame_count == 0:
+            raise ValueError(
+                "Not enough Charuco detections to calibrate. "
+                f"Need frames where at least {min_cameras} cameras each see >= {min_corners} corners. "
+                f"Cameras without usable frames: {empty_camera_indices}. "
+                f"Shared usable frame count: {shared_frame_count}. "
+                + " | ".join(summary_lines)
+            )
+
     def _get_charuco_2d_data(self, videos: List[List[str]], board: "AniposeCharucoBoard"):
         """
         Processes a list of a list of videos to extract Charuco 2D data.
@@ -1975,6 +2023,7 @@ class CameraGroup:
         Also takes a board which specifies what should be detected in the videos"""
 
         all_rows = self.get_rows_videos(videos, board, verbose=verbose)
+        self._validate_charuco_rows_for_calibration(all_rows)
         if init_extrinsics:
             self.set_camera_sizes_videos(videos)
 

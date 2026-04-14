@@ -96,6 +96,7 @@ TRANSLATIONS = {
         "no_calibration_videos": "还没有可标定的视频。请先录制并等待保存完成。",
         "calibration_started": "开始运行 FreeMoCap 标定：{path}",
         "calibration_finished": "标定完成：{path}",
+        "calibration_failed": "标定失败：{message}",
         "groundplane_failed": "地面原点标定失败：{message}",
         "runtime_not_ready": "GMR / MuJoCo 运行时环境未就绪：{error}",
     },
@@ -147,6 +148,7 @@ TRANSLATIONS = {
         "no_calibration_videos": "No calibration videos are ready. Record and wait for saving first.",
         "calibration_started": "Starting FreeMoCap calibration: {path}",
         "calibration_finished": "Calibration finished: {path}",
+        "calibration_failed": "Calibration failed: {message}",
         "groundplane_failed": "Groundplane calibration failed: {message}",
         "runtime_not_ready": "GMR/MuJoCo runtime is not ready: {error}",
     },
@@ -557,6 +559,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         )
         self._calibration_worker.in_progress.connect(self._append_log)
         self._calibration_worker.finished.connect(self._handle_calibration_finished)
+        self._calibration_worker.failed.connect(self._handle_calibration_failed)
         self._calibration_worker.groundplane_failed.connect(self._handle_groundplane_failed)
         self._run_calibration_button.setEnabled(False)
         self._append_log(self._tr("calibration_started", path=self._active_calibration_videos_folder))
@@ -566,6 +569,10 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._calibration_line_edit.setText(toml_path)
         self._run_calibration_button.setEnabled(True)
         self._append_log(self._tr("calibration_finished", path=toml_path))
+
+    def _handle_calibration_failed(self, message: str) -> None:
+        self._run_calibration_button.setEnabled(True)
+        self._append_log(self._tr("calibration_failed", message=message))
 
     def _handle_groundplane_failed(self, message: str) -> None:
         self._append_log(self._tr("groundplane_failed", message=message))

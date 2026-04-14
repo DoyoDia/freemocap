@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 class AniposeCalibrationThreadWorker(QThread):
     finished = Signal(str)
+    failed = Signal(str)
     in_progress = Signal(str)
     groundplane_failed = Signal(str)
 
@@ -52,6 +53,7 @@ class AniposeCalibrationThreadWorker(QThread):
     def run(self):
         logger.info("Beginning Anipose calibration with Charuco Square Size (mm): {}".format(self._charuco_square_size))
 
+        calibration_success = False
         try:
             toml_path, groundplane_success = run_anipose_capture_volume_calibration(
                 charuco_board_definition=self._charuco_board_definition,
@@ -61,6 +63,7 @@ class AniposeCalibrationThreadWorker(QThread):
                 use_charuco_as_groundplane=self._use_charuco_as_groundplane,
                 progress_callback=self._emit_in_progress_data,
             )
+            calibration_success = True
             self.finished.emit(str(toml_path))
             if groundplane_success:
                 if groundplane_success.success is False:
@@ -71,7 +74,11 @@ class AniposeCalibrationThreadWorker(QThread):
         except Exception as e:
             logger.exception("something went wrong in the anipose calibration")
             logger.exception(e)
+            self.failed.emit(str(e))
 
         self._work_done = True
 
-        logger.info("Anipose Calibration Complete")
+        if calibration_success:
+            logger.info("Anipose Calibration Complete")
+        else:
+            logger.info("Anipose Calibration Failed")
