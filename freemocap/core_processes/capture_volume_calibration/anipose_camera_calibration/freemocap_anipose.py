@@ -2245,6 +2245,44 @@ class AniposeCharucoBoard(CharucoBoard):
         K = camera.get_camera_matrix()
         D = camera.get_distortions()
 
-        ret, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(corners, ids, self.board, K, D, None, None)
+        if hasattr(cv2.aruco, "estimatePoseCharucoBoard"):
+            ret, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(corners, ids, self.board, K, D, None, None)
+            if ret:
+                return rvec, tvec
+            return None, None
 
-        return rvec, tvec
+        object_points, image_points = self._match_charuco_pose_points(corners=corners, ids=ids)
+        if object_points is None or image_points is None or len(object_points) < 4:
+            return None, None
+
+        try:
+            solve_pnp_flag = cv2.SOLVEPNP_IPPE if hasattr(cv2, "SOLVEPNP_IPPE") else cv2.SOLVEPNP_ITERATIVE
+            ret, rvec, tvec = cv2.solvePnP(
+                object_points,
+                image_points,
+                K,
+                D,
+                flags=solve_pnp_flag,
+            )
+        except cv2.error:
+            return None, None
+
+        if ret:
+            return rvec, tvec
+        return None, None
+
+    def _match_charuco_pose_points(self, corners, ids):
+        corners = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+        ids = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
+        if hasattr(self.board, "matchImagePoints"):
+            object_points, image_points = self.board.matchImagePoints(corners, ids)
+            return object_points.astype(np.float32), image_points.astype(np.float32)
+
+        ids_flat = ids.reshape(-1).astype(int)
+        valid_mask = (ids_flat >= 0) & (ids_flat < len(self.objPoints))
+        if not np.any(valid_mask):
+            return None, None
+
+        object_points = self.objPoints[ids_flat[valid_mask]].reshape(-1, 1, 3).astype(np.float32)
+        image_points = corners[valid_mask].reshape(-1, 1, 2).astype(np.float32)
+        return object_points, image_points
