@@ -73,6 +73,20 @@ def test_converter_can_preserve_ground_height() -> None:
     assert np.isclose(ground_pose["Pelvis"][0][2], 1.0, atol=1e-6)
 
 
+def test_converter_can_compress_lower_body_width() -> None:
+    points = _synthetic_mediapipe_points()
+
+    normal_converter = bridge.FreeMoCapXRobotConverter.from_calibration_frames([points])
+    compressed_converter = bridge.FreeMoCapXRobotConverter.from_calibration_frames([points], leg_width_scale=0.5)
+
+    normal_pose = normal_converter.to_body_pose_dict(points)
+    compressed_pose = compressed_converter.to_body_pose_dict(points)
+    normal_width = abs(normal_pose["Right_Knee"][0][1] - normal_pose["Left_Knee"][0][1])
+    compressed_width = abs(compressed_pose["Right_Knee"][0][1] - compressed_pose["Left_Knee"][0][1])
+
+    assert np.isclose(compressed_width, normal_width * 0.5, atol=1e-6)
+
+
 def test_qpos_serialization_matches_sim2real_frame_shape() -> None:
     frame = bridge.FreeMoCapToGMRBridge._serialize_qpos_frame(bridge.DEFAULT_QPOS_G1)
 

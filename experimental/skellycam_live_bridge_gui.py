@@ -113,6 +113,8 @@ TRANSLATIONS = {
         "human_height": "人体身高",
         "model_complexity": "模型复杂度",
         "parallel_tracking": "并行相机 2D 识别",
+        "leg_width_scale": "腿宽压缩",
+        "min_valid_2d_ratio": "最低 2D 有效比例",
         "mujoco_viewer": "MuJoCo 可视化",
         "mujoco_fps": "MuJoCo FPS",
         "max_camera_skew": "相机最大时间差 ms",
@@ -179,6 +181,8 @@ TRANSLATIONS = {
         "human_height": "Human height",
         "model_complexity": "Model complexity",
         "parallel_tracking": "Parallel camera tracking",
+        "leg_width_scale": "Leg width scale",
+        "min_valid_2d_ratio": "Minimum valid 2D ratio",
         "mujoco_viewer": "MuJoCo viewer",
         "mujoco_fps": "MuJoCo FPS",
         "max_camera_skew": "Max camera skew ms",
@@ -438,6 +442,22 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._preserve_ground_height_checkbox.setChecked(True)
         form.addRow("", self._preserve_ground_height_checkbox)
 
+        self._leg_width_scale_label = QLabel()
+        self._leg_width_scale_spin = QDoubleSpinBox()
+        self._leg_width_scale_spin.setRange(0.0, 2.0)
+        self._leg_width_scale_spin.setDecimals(2)
+        self._leg_width_scale_spin.setSingleStep(0.05)
+        self._leg_width_scale_spin.setValue(0.55)
+        form.addRow(self._leg_width_scale_label, self._leg_width_scale_spin)
+
+        self._min_valid_2d_ratio_label = QLabel()
+        self._min_valid_2d_ratio_spin = QDoubleSpinBox()
+        self._min_valid_2d_ratio_spin.setRange(0.0, 1.0)
+        self._min_valid_2d_ratio_spin.setDecimals(2)
+        self._min_valid_2d_ratio_spin.setSingleStep(0.05)
+        self._min_valid_2d_ratio_spin.setValue(0.75)
+        form.addRow(self._min_valid_2d_ratio_label, self._min_valid_2d_ratio_spin)
+
         self._mujoco_viewer_checkbox = QCheckBox()
         self._mujoco_viewer_checkbox.setChecked(True)
         form.addRow("", self._mujoco_viewer_checkbox)
@@ -519,6 +539,8 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._human_height_label.setText(self._tr("human_height"))
         self._model_complexity_label.setText(self._tr("model_complexity"))
         self._parallel_tracking_checkbox.setText(self._tr("parallel_tracking"))
+        self._leg_width_scale_label.setText(self._tr("leg_width_scale"))
+        self._min_valid_2d_ratio_label.setText(self._tr("min_valid_2d_ratio"))
         self._mujoco_viewer_checkbox.setText(self._tr("mujoco_viewer"))
         self._mujoco_fps_label.setText(self._tr("mujoco_fps"))
         self._max_camera_skew_label.setText(self._tr("max_camera_skew"))
@@ -593,6 +615,10 @@ class SkellycamLiveBridgeLauncher(QWidget):
             self._model_complexity_spin.setValue(int(settings.get("model_complexity", self._model_complexity_spin.value())))
             self._parallel_tracking_checkbox.setChecked(bool(settings.get("parallel_tracking", True)))
             self._preserve_ground_height_checkbox.setChecked(bool(settings.get("preserve_ground_height", True)))
+            self._leg_width_scale_spin.setValue(float(settings.get("leg_width_scale", self._leg_width_scale_spin.value())))
+            self._min_valid_2d_ratio_spin.setValue(
+                float(settings.get("min_valid_2d_ratio", self._min_valid_2d_ratio_spin.value()))
+            )
             self._mujoco_viewer_checkbox.setChecked(bool(settings.get("mujoco_viewer", True)))
             self._mujoco_fps_spin.setValue(float(settings.get("mujoco_fps", self._mujoco_fps_spin.value())))
             self._max_camera_skew_spin.setValue(float(settings.get("max_camera_skew_ms", self._max_camera_skew_spin.value())))
@@ -626,6 +652,8 @@ class SkellycamLiveBridgeLauncher(QWidget):
             "model_complexity": self._model_complexity_spin.value(),
             "parallel_tracking": self._parallel_tracking_checkbox.isChecked(),
             "preserve_ground_height": self._preserve_ground_height_checkbox.isChecked(),
+            "leg_width_scale": self._leg_width_scale_spin.value(),
+            "min_valid_2d_ratio": self._min_valid_2d_ratio_spin.value(),
             "mujoco_viewer": self._mujoco_viewer_checkbox.isChecked(),
             "mujoco_fps": self._mujoco_fps_spin.value(),
             "max_camera_skew_ms": self._max_camera_skew_spin.value(),
@@ -965,6 +993,10 @@ class SkellycamLiveBridgeLauncher(QWidget):
             str(self._model_complexity_spin.value()),
             "--actual-human-height",
             str(self._human_height_spin.value()),
+            "--leg-width-scale",
+            str(self._leg_width_scale_spin.value()),
+            "--min-valid-2d-ratio",
+            str(self._min_valid_2d_ratio_spin.value()),
             "--max-camera-skew-ms",
             str(self._max_camera_skew_spin.value()),
             "--req-bind-addr",

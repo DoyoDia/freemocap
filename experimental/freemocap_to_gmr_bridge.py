@@ -284,9 +284,10 @@ def _interpolate_qpos(prev_qpos: np.ndarray, next_qpos: np.ndarray, alpha: float
 
 
 class FreeMoCapXRobotConverter:
-    def __init__(self, source_origin: np.ndarray, source_to_target_basis: np.ndarray):
+    def __init__(self, source_origin: np.ndarray, source_to_target_basis: np.ndarray, leg_width_scale: float = 1.0):
         self.source_origin = np.asarray(source_origin, dtype=np.float64).reshape(3)
         self.source_to_target_basis = np.asarray(source_to_target_basis, dtype=np.float64).reshape(3, 3)
+        self.leg_width_scale = float(np.clip(leg_width_scale, 0.0, 2.0))
         self.previous_points_by_name: Dict[str, np.ndarray] = {}
         self.previous_quats_by_name: Dict[str, np.ndarray] = {}
 
@@ -296,6 +297,7 @@ class FreeMoCapXRobotConverter:
         frames_m: Sequence[np.ndarray],
         preserve_ground_height: bool = False,
         ground_z_m: float = 0.0,
+        leg_width_scale: float = 1.0,
     ) -> "FreeMoCapXRobotConverter":
         usable = [np.asarray(frame, dtype=np.float64).reshape(33, 3) for frame in frames_m if cls._frame_has_torso(frame)]
         if not usable:
@@ -318,7 +320,7 @@ class FreeMoCapXRobotConverter:
         body_forward = _unit(np.cross(body_right, body_up), [1.0, 0.0, 0.0])
         body_up = _unit(np.cross(body_forward, body_right), [0.0, 0.0, 1.0])
         basis = np.stack([body_forward, body_right, body_up], axis=1)
-        return cls(source_origin=source_origin, source_to_target_basis=basis)
+        return cls(source_origin=source_origin, source_to_target_basis=basis, leg_width_scale=leg_width_scale)
 
     @staticmethod
     def _frame_has_torso(points: np.ndarray) -> bool:
@@ -378,7 +380,7 @@ class FreeMoCapXRobotConverter:
         ]
         head_raw = np.mean(np.stack(head_candidates, axis=0), axis=0) if head_candidates else neck
 
-        return {
+        positions = {
             "Pelvis": pelvis,
             "Left_Hip": self._fallback_point("Left_Hip", left_hip, pelvis),
             "Right_Hip": self._fallback_point("Right_Hip", right_hip, pelvis),
@@ -404,6 +406,27 @@ class FreeMoCapXRobotConverter:
             "Left_Hand": self._fallback_point("Left_Hand", self._hand_point(points, "left"), left_shoulder),
             "Right_Hand": self._fallback_point("Right_Hand", self._hand_point(points, "right"), right_shoulder),
         }
+        self._compress_lower_body_width(positions)
+        return positions
+
+    def _compress_lower_body_width(self, positions: Dict[str, np.ndarray]) -> None:
+        if np.isclose(self.leg_width_scale, 1.0):
+            return
+        pelvis = positions["Pelvis"]
+        lower_body_keys = (
+            "Left_Hip",
+            "Right_Hip",
+            "Left_Knee",
+            "Right_Knee",
+            "Left_Ankle",
+            "Right_Ankle",
+            "Left_Foot",
+            "Right_Foot",
+        )
+        for key in lower_body_keys:
+            offset = positions[key] - pelvis
+            offset[1] *= self.leg_width_scale
+            positions[key] = pelvis + offset
 
     def _torso_quat(self, positions: Dict[str, np.ndarray]) -> np.ndarray:
         body_right = _unit(positions["Right_Hip"] - positions["Left_Hip"], [0.0, 1.0, 0.0])
@@ -809,6 +832,11 @@ class FreeMoCapToGMRBridge:
                             f"valid_2d={mocap_frame.valid_2d_point_ratio * 100.0:.1f}%"
                         )
                         self._logged_first_mocap_frame = True
+                    if float(mocap_frame.valid_2d_point_ratio) < float(self.args.min_valid_2d_ratio):
+                        with self.stats_lock:
+                            self.stats["last_valid_2d_ratio"] = mocap_frame.valid_2d_point_ratio
+                            self.stats["latest_seq"] = int(mocap_frame.seq + loop_count * 1000000)
+                        continue
                     points_m = np.asarray(mocap_frame.points_3d, dtype=np.float32).reshape(33, 3) * 0.001
                     if converter is None:
                         if FreeMoCapXRobotConverter._frame_has_torso(points_m):
@@ -817,10 +845,13 @@ class FreeMoCapToGMRBridge:
                             converter = FreeMoCapXRobotConverter.from_calibration_frames(
                                 calibration_frames,
                                 preserve_ground_height=bool(self.args.preserve_ground_height),
+                                leg_width_scale=float(self.args.leg_width_scale),
                             )
                             print(
                                 f"FreeMoCap calibration ready with {len(calibration_frames)} frames "
-                                f"(preserve_ground_height={self.args.preserve_ground_height})"
+                                f"(preserve_ground_height={self.args.preserve_ground_height}, "
+                                f"leg_width_scale={self.args.leg_width_scale}, "
+                                f"min_valid_2d_ratio={self.args.min_valid_2d_ratio})"
                             )
                             self._logged_calibration_ready = True
                         continue
@@ -1101,6 +1132,8 @@ class FreeMoCapToGMRBridge:
         print(f"  parallel_camera_tracking: {self.args.parallel_camera_tracking}")
         print(f"  actual_human_height: {self.args.actual_human_height}")
         print(f"  preserve_ground_height: {self.args.preserve_ground_height}")
+        print(f"  leg_width_scale: {self.args.leg_width_scale}")
+        print(f"  min_valid_2d_ratio: {self.args.min_valid_2d_ratio}")
         print(f"  gmr_max_iter: {self.args.gmr_max_iter}")
         print(f"  mock_gmr: {self.args.mock_gmr}")
         print(f"  mujoco_viewer: {self.args.mujoco_viewer}")
@@ -1178,6 +1211,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-triangulation-prewarm", action="store_true")
     parser.add_argument("--calibration-frames", type=int, default=30)
     parser.add_argument("--preserve-ground-height", action="store_true")
+    parser.add_argument("--leg-width-scale", type=float, default=0.55)
+    parser.add_argument("--min-valid-2d-ratio", type=float, default=0.75)
     parser.add_argument("--actual-human-height", type=float, default=1.6)
     parser.add_argument("--gmr-max-iter", type=int, default=5)
     parser.add_argument("--mock-gmr", action="store_true")
@@ -1209,6 +1244,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--max-camera-skew-ms must be positive")
     if args.calibration_frames <= 0:
         raise ValueError("--calibration-frames must be positive")
+    if not 0.0 <= args.leg_width_scale <= 2.0:
+        raise ValueError("--leg-width-scale must be between 0 and 2")
+    if not 0.0 <= args.min_valid_2d_ratio <= 1.0:
+        raise ValueError("--min-valid-2d-ratio must be between 0 and 1")
     if args.ctrl_fps <= 0:
         raise ValueError("--ctrl-fps must be positive")
     if args.reply_fps <= 0:
