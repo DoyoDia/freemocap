@@ -72,6 +72,7 @@ def gmr_scipy_patch_state(repo_root: Path | None = None) -> PatchState:
 def validate_gmr_runtime(
     repo_root: Path | None = None,
     *,
+    require_import: bool = True,
     require_mujoco: bool = False,
     require_patch: bool = True,
 ) -> GMRRuntimeStatus:
@@ -83,14 +84,15 @@ def validate_gmr_runtime(
             "Run: git submodule update --init --recursive external/GMR"
         )
 
-    try:
-        importlib.import_module("general_motion_retargeting")
-    except ImportError as exc:
-        raise RuntimeError(
-            f"Failed to import general_motion_retargeting from {gmr_root}: {exc}. "
-            "Install the package into the active environment with "
-            "'python -m pip install -e external/GMR'."
-        ) from exc
+    if require_import:
+        try:
+            importlib.import_module("general_motion_retargeting")
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Failed to import general_motion_retargeting from {gmr_root}: {exc}. "
+                "Install the package into the active environment with "
+                "'python -m pip install -e external/GMR'."
+            ) from exc
 
     if require_mujoco:
         try:

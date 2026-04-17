@@ -156,6 +156,29 @@ def test_validate_gmr_runtime_import_error_mentions_install_command(monkeypatch,
         gmr_runtime.validate_gmr_runtime(tmp_path, require_mujoco=False, require_patch=False)
 
 
+def test_validate_gmr_runtime_can_skip_gmr_import(monkeypatch, tmp_path: Path) -> None:
+    gmr_root = tmp_path / "external" / "GMR"
+    unitree_xml = gmr_root / "assets" / "unitree_g1" / "g1_mocap_29dof.xml"
+    unitree_xml.parent.mkdir(parents=True)
+    unitree_xml.write_text("<mujoco/>", encoding="utf-8")
+
+    def _raise_if_imported(name: str):
+        if name == "general_motion_retargeting":
+            raise AssertionError("GUI preflight should not import GMR")
+        raise ImportError(name)
+
+    monkeypatch.setattr(gmr_runtime.importlib, "import_module", _raise_if_imported)
+
+    status = gmr_runtime.validate_gmr_runtime(
+        tmp_path,
+        require_import=False,
+        require_mujoco=False,
+        require_patch=False,
+    )
+
+    assert status.unitree_g1_xml == unitree_xml
+
+
 def test_gmr_runtime_can_load_unitree_g1_mujoco_model() -> None:
     import pytest
 

@@ -729,6 +729,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
             # actual MuJoCo import check in its own process.
             validate_gmr_runtime(
                 REPO_ROOT,
+                require_import=False,
                 require_mujoco=False,
                 require_patch=True,
             )
