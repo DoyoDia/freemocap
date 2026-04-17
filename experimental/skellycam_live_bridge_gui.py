@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from PySide6.QtCore import QProcess, Qt, QTimer
+from PySide6.QtCore import QProcess, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 
 from skellycam_live_source import configure_skellycam_runtime_home
 from gmr_runtime import validate_gmr_runtime
+from groundplane_only_calibration import apply_groundplane_to_calibration_toml
 from skellycam_preview_latency_patch import install_latest_frame_preview_patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +50,41 @@ from freemocap.gui.qt.workers.anipose_calibration_thread_worker import AniposeCa
 from skellycam import CameraConfig, SkellyCamParameterTreeWidget, SkellyCamWidget
 
 
+class GroundplaneCalibrationThreadWorker(QThread):
+    finished = Signal(str)
+    failed = Signal(str)
+    in_progress = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        calibration_toml: Path,
+        calibration_videos_folder: Path,
+        charuco_square_size: float,
+        charuco_board_name: str,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._calibration_toml = calibration_toml
+        self._calibration_videos_folder = calibration_videos_folder
+        self._charuco_square_size = charuco_square_size
+        self._charuco_board_name = charuco_board_name
+
+    def run(self) -> None:
+        try:
+            result = apply_groundplane_to_calibration_toml(
+                calibration_toml=self._calibration_toml,
+                calibration_videos_folder=self._calibration_videos_folder,
+                charuco_square_size=self._charuco_square_size,
+                charuco_board_name=self._charuco_board_name,
+                progress_callback=self.in_progress.emit,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(str(result.output_toml_path))
+
+
 TRANSLATIONS = {
     "zh": {
         "window_title": "Skellycam 实时 FreeMoCap -> GMR 桥",
@@ -59,12 +95,14 @@ TRANSLATIONS = {
         "charuco_square_size": "Charuco 方格边长 (mm)",
         "charuco_board": "Charuco 板型",
         "groundplane": "用初始 Charuco 板作为地面原点",
+        "preserve_ground_height": "保留地面高度（使用地面标定 TOML 时建议开启）",
         "annotate_charuco": "预览叠加 Charuco 检测（切换后可能需要重连相机）",
         "auto_fast_connect": "启动时快速连接上次相机",
         "fast_connect": "快速连接上次相机",
         "record_calibration": "开始录制标定视频",
         "stop_calibration": "停止录制标定视频",
         "run_calibration": "运行 FreeMoCap 标定",
+        "run_groundplane": "只重标定地面",
         "active_recording": "当前标定录制",
         "no_calibration_recording": "还没有录制标定视频。",
         "bridge_group": "实时桥",
@@ -108,6 +146,9 @@ TRANSLATIONS = {
         "calibration_started": "开始运行 FreeMoCap 标定：{path}",
         "calibration_finished": "标定完成：{path}",
         "calibration_failed": "标定失败：{message}",
+        "groundplane_started": "开始只重标定地面：{path}",
+        "groundplane_finished": "地面重标定完成：{path}",
+        "groundplane_requires_toml": "请先选择一个已经成功的相机标定 TOML，再只重标定地面。",
         "groundplane_failed": "地面原点标定失败：{message}",
         "runtime_not_ready": "GMR / MuJoCo 运行时环境未就绪：{error}",
     },
@@ -120,12 +161,14 @@ TRANSLATIONS = {
         "charuco_square_size": "Charuco square size (mm)",
         "charuco_board": "Charuco board",
         "groundplane": "Use initial Charuco board as groundplane origin",
+        "preserve_ground_height": "Preserve ground height (recommended with groundplane TOML)",
         "annotate_charuco": "Overlay Charuco detection in preview (may need reconnect)",
         "auto_fast_connect": "Fast-connect last cameras on startup",
         "fast_connect": "Fast Connect Last Cameras",
         "record_calibration": "Start Calibration Recording",
         "stop_calibration": "Stop Calibration Recording",
         "run_calibration": "Run FreeMoCap Calibration",
+        "run_groundplane": "Groundplane Only",
         "active_recording": "Active calibration recording",
         "no_calibration_recording": "No calibration recording yet.",
         "bridge_group": "Live Bridge",
@@ -169,6 +212,9 @@ TRANSLATIONS = {
         "calibration_started": "Starting FreeMoCap calibration: {path}",
         "calibration_finished": "Calibration finished: {path}",
         "calibration_failed": "Calibration failed: {message}",
+        "groundplane_started": "Starting groundplane-only calibration: {path}",
+        "groundplane_finished": "Groundplane-only calibration finished: {path}",
+        "groundplane_requires_toml": "Select an existing successful camera calibration TOML before running groundplane-only calibration.",
         "groundplane_failed": "Groundplane calibration failed: {message}",
         "runtime_not_ready": "GMR/MuJoCo runtime is not ready: {error}",
     },
@@ -223,6 +269,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
 
         self._bridge_process: Optional[QProcess] = None
         self._calibration_worker: Optional[AniposeCalibrationThreadWorker] = None
+        self._groundplane_worker: Optional[GroundplaneCalibrationThreadWorker] = None
         self._kill_thread_event = threading.Event()
         self._camera_config_json_path = RUNTIME_HOME / "live_bridge_camera_configs.json"
         self._active_calibration_recording_folder: Optional[Path] = None
@@ -328,14 +375,18 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._start_calibration_recording_button = QPushButton()
         self._stop_calibration_recording_button = QPushButton()
         self._run_calibration_button = QPushButton()
+        self._run_groundplane_button = QPushButton()
         self._stop_calibration_recording_button.setEnabled(False)
         self._run_calibration_button.setEnabled(False)
+        self._run_groundplane_button.setEnabled(False)
         self._start_calibration_recording_button.clicked.connect(self._start_calibration_recording)
         self._stop_calibration_recording_button.clicked.connect(self._stop_calibration_recording)
         self._run_calibration_button.clicked.connect(self._run_calibration)
+        self._run_groundplane_button.clicked.connect(self._run_groundplane_calibration)
         button_row.addWidget(self._start_calibration_recording_button)
         button_row.addWidget(self._stop_calibration_recording_button)
         button_row.addWidget(self._run_calibration_button)
+        button_row.addWidget(self._run_groundplane_button)
         form.addRow("", button_row)
 
         self._active_recording_label = QLabel()
@@ -382,6 +433,10 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._parallel_tracking_checkbox = QCheckBox()
         self._parallel_tracking_checkbox.setChecked(True)
         form.addRow("", self._parallel_tracking_checkbox)
+
+        self._preserve_ground_height_checkbox = QCheckBox()
+        self._preserve_ground_height_checkbox.setChecked(True)
+        form.addRow("", self._preserve_ground_height_checkbox)
 
         self._mujoco_viewer_checkbox = QCheckBox()
         self._mujoco_viewer_checkbox.setChecked(True)
@@ -444,12 +499,14 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._charuco_square_size_label.setText(self._tr("charuco_square_size"))
         self._charuco_board_label.setText(self._tr("charuco_board"))
         self._groundplane_checkbox.setText(self._tr("groundplane"))
+        self._preserve_ground_height_checkbox.setText(self._tr("preserve_ground_height"))
         self._annotate_charuco_checkbox.setText(self._tr("annotate_charuco"))
         self._auto_fast_connect_checkbox.setText(self._tr("auto_fast_connect"))
         self._fast_connect_button.setText(self._tr("fast_connect"))
         self._start_calibration_recording_button.setText(self._tr("record_calibration"))
         self._stop_calibration_recording_button.setText(self._tr("stop_calibration"))
         self._run_calibration_button.setText(self._tr("run_calibration"))
+        self._run_groundplane_button.setText(self._tr("run_groundplane"))
         self._active_recording_label.setText(self._tr("active_recording"))
         if self._active_calibration_recording_folder is None:
             self._active_recording_value_label.setText(self._tr("no_calibration_recording"))
@@ -535,6 +592,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
             self._human_height_spin.setValue(float(settings.get("human_height", self._human_height_spin.value())))
             self._model_complexity_spin.setValue(int(settings.get("model_complexity", self._model_complexity_spin.value())))
             self._parallel_tracking_checkbox.setChecked(bool(settings.get("parallel_tracking", True)))
+            self._preserve_ground_height_checkbox.setChecked(bool(settings.get("preserve_ground_height", True)))
             self._mujoco_viewer_checkbox.setChecked(bool(settings.get("mujoco_viewer", True)))
             self._mujoco_fps_spin.setValue(float(settings.get("mujoco_fps", self._mujoco_fps_spin.value())))
             self._max_camera_skew_spin.setValue(float(settings.get("max_camera_skew_ms", self._max_camera_skew_spin.value())))
@@ -567,6 +625,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
             "human_height": self._human_height_spin.value(),
             "model_complexity": self._model_complexity_spin.value(),
             "parallel_tracking": self._parallel_tracking_checkbox.isChecked(),
+            "preserve_ground_height": self._preserve_ground_height_checkbox.isChecked(),
             "mujoco_viewer": self._mujoco_viewer_checkbox.isChecked(),
             "mujoco_fps": self._mujoco_fps_spin.value(),
             "max_camera_skew_ms": self._max_camera_skew_spin.value(),
@@ -753,6 +812,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._next_recording_folder = recording_folder
         self._active_recording_value_label.setText(str(recording_folder))
         self._run_calibration_button.setEnabled(False)
+        self._run_groundplane_button.setEnabled(False)
         self._set_preview_charuco_board(self._charuco_board_combo.currentText())
         self._restore_annotate_charuco_after_recording = self._annotate_charuco_checkbox.isChecked()
         self._annotate_charuco_checkbox.setEnabled(False)
@@ -786,6 +846,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._active_calibration_videos_folder = videos_folder
         self._active_recording_value_label.setText(str(self._active_calibration_recording_folder))
         self._run_calibration_button.setEnabled(True)
+        self._run_groundplane_button.setEnabled(True)
         self._save_gui_settings()
         self._append_log(self._tr("calibration_videos_saved", path=videos_folder))
 
@@ -808,18 +869,58 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._calibration_worker.failed.connect(self._handle_calibration_failed)
         self._calibration_worker.groundplane_failed.connect(self._handle_groundplane_failed)
         self._run_calibration_button.setEnabled(False)
+        self._run_groundplane_button.setEnabled(False)
         self._append_log(self._tr("calibration_started", path=self._active_calibration_videos_folder))
         self._calibration_worker.start()
+
+    def _run_groundplane_calibration(self) -> None:
+        if self._active_calibration_videos_folder is None:
+            self._append_log(self._tr("no_calibration_videos"))
+            return
+        calibration_toml = Path(self._calibration_line_edit.text()).expanduser()
+        if not calibration_toml.exists():
+            self._append_log(self._tr("groundplane_requires_toml"))
+            return
+
+        self._groundplane_worker = GroundplaneCalibrationThreadWorker(
+            calibration_toml=calibration_toml,
+            calibration_videos_folder=self._active_calibration_videos_folder,
+            charuco_square_size=float(self._charuco_square_size_spin.value()),
+            charuco_board_name=self._charuco_board_combo.currentText(),
+            parent=self,
+        )
+        self._groundplane_worker.in_progress.connect(self._append_log)
+        self._groundplane_worker.finished.connect(self._handle_groundplane_finished)
+        self._groundplane_worker.failed.connect(self._handle_groundplane_only_failed)
+        self._run_calibration_button.setEnabled(False)
+        self._run_groundplane_button.setEnabled(False)
+        self._append_log(self._tr("groundplane_started", path=self._active_calibration_videos_folder))
+        self._groundplane_worker.start()
 
     def _handle_calibration_finished(self, toml_path: str) -> None:
         self._calibration_line_edit.setText(toml_path)
         self._run_calibration_button.setEnabled(True)
+        self._run_groundplane_button.setEnabled(self._active_calibration_videos_folder is not None)
         self._save_gui_settings()
         self._append_log(self._tr("calibration_finished", path=toml_path))
 
     def _handle_calibration_failed(self, message: str) -> None:
         self._run_calibration_button.setEnabled(True)
+        self._run_groundplane_button.setEnabled(self._active_calibration_videos_folder is not None)
         self._append_log(self._tr("calibration_failed", message=message))
+
+    def _handle_groundplane_finished(self, toml_path: str) -> None:
+        self._calibration_line_edit.setText(toml_path)
+        self._run_calibration_button.setEnabled(True)
+        self._run_groundplane_button.setEnabled(True)
+        self._preserve_ground_height_checkbox.setChecked(True)
+        self._save_gui_settings()
+        self._append_log(self._tr("groundplane_finished", path=toml_path))
+
+    def _handle_groundplane_only_failed(self, message: str) -> None:
+        self._run_calibration_button.setEnabled(True)
+        self._run_groundplane_button.setEnabled(self._active_calibration_videos_folder is not None)
+        self._append_log(self._tr("groundplane_failed", message=message))
 
     def _handle_groundplane_failed(self, message: str) -> None:
         self._append_log(self._tr("groundplane_failed", message=message))
@@ -875,6 +976,8 @@ class SkellycamLiveBridgeLauncher(QWidget):
         ]
         if self._parallel_tracking_checkbox.isChecked():
             args.append("--parallel-camera-tracking")
+        if self._preserve_ground_height_checkbox.isChecked():
+            args.append("--preserve-ground-height")
         if self._mujoco_viewer_checkbox.isChecked():
             args.extend(
                 [

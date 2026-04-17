@@ -275,6 +275,7 @@ class AniposeCameraCalibrator:
         charuco_3d_xyz_interpolated = skellyforge_data(raw_charuco_data=charuco_3d_xyz)
 
         charuco_save_path = self._recording_folder_path / "output_data" / "charuco_3d_xyz.npy"
+        charuco_save_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(charuco_save_path,
                 charuco_3d_xyz_interpolated)  # NOTE - there may be a more robust way to get this path but this is the simplest for now
         logger.info(f"Charuco 3d data saved to {charuco_save_path}")

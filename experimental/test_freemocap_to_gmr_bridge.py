@@ -3,11 +3,17 @@ from __future__ import annotations
 import sys
 import threading
 import queue
+import os
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+_TEST_RUNTIME_HOME = Path(__file__).resolve().parents[1] / ".venv" / ".pytest_runtime"
+(_TEST_RUNTIME_HOME / "ultralytics" / "Ultralytics").mkdir(parents=True, exist_ok=True)
+(_TEST_RUNTIME_HOME / "matplotlib").mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("YOLO_CONFIG_DIR", str(_TEST_RUNTIME_HOME / "ultralytics"))
+os.environ.setdefault("MPLCONFIGDIR", str(_TEST_RUNTIME_HOME / "matplotlib"))
 
 import freemocap_to_gmr_bridge as bridge
 import gmr_runtime
@@ -50,6 +56,21 @@ def test_freemocap_to_xrobot_converter_shapes_and_quaternions() -> None:
         assert np.isfinite(pos).all()
         assert np.isfinite(quat).all()
         assert np.isclose(np.linalg.norm(quat), 1.0, atol=1e-4)
+
+
+def test_converter_can_preserve_ground_height() -> None:
+    points = _synthetic_mediapipe_points() + np.array([2.0, -3.0, 1.0])
+
+    default_converter = bridge.FreeMoCapXRobotConverter.from_calibration_frames([points])
+    ground_converter = bridge.FreeMoCapXRobotConverter.from_calibration_frames(
+        [points],
+        preserve_ground_height=True,
+    )
+
+    default_pose = default_converter.to_body_pose_dict(points)
+    ground_pose = ground_converter.to_body_pose_dict(points)
+    assert np.isclose(default_pose["Pelvis"][0][2], 0.0, atol=1e-6)
+    assert np.isclose(ground_pose["Pelvis"][0][2], 1.0, atol=1e-6)
 
 
 def test_qpos_serialization_matches_sim2real_frame_shape() -> None:

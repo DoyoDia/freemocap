@@ -291,7 +291,12 @@ class FreeMoCapXRobotConverter:
         self.previous_quats_by_name: Dict[str, np.ndarray] = {}
 
     @classmethod
-    def from_calibration_frames(cls, frames_m: Sequence[np.ndarray]) -> "FreeMoCapXRobotConverter":
+    def from_calibration_frames(
+        cls,
+        frames_m: Sequence[np.ndarray],
+        preserve_ground_height: bool = False,
+        ground_z_m: float = 0.0,
+    ) -> "FreeMoCapXRobotConverter":
         usable = [np.asarray(frame, dtype=np.float64).reshape(33, 3) for frame in frames_m if cls._frame_has_torso(frame)]
         if not usable:
             raise ValueError("No usable calibration frames with hips and shoulders.")
@@ -300,12 +305,20 @@ class FreeMoCapXRobotConverter:
         shoulder_center = 0.5 * (
             mean_points[MEDIAPIPE["left_shoulder"]] + mean_points[MEDIAPIPE["right_shoulder"]]
         )
-        body_right = _unit(mean_points[MEDIAPIPE["right_hip"]] - mean_points[MEDIAPIPE["left_hip"]], [0.0, 1.0, 0.0])
-        body_up = _unit(shoulder_center - pelvis, [0.0, 0.0, 1.0])
+        body_right = mean_points[MEDIAPIPE["right_hip"]] - mean_points[MEDIAPIPE["left_hip"]]
+        if preserve_ground_height:
+            body_right = body_right.astype(np.float64, copy=True)
+            body_right[2] = 0.0
+            body_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            source_origin = np.array([pelvis[0], pelvis[1], float(ground_z_m)], dtype=np.float64)
+        else:
+            body_up = _unit(shoulder_center - pelvis, [0.0, 0.0, 1.0])
+            source_origin = pelvis
+        body_right = _unit(body_right, [0.0, 1.0, 0.0])
         body_forward = _unit(np.cross(body_right, body_up), [1.0, 0.0, 0.0])
         body_up = _unit(np.cross(body_forward, body_right), [0.0, 0.0, 1.0])
         basis = np.stack([body_forward, body_right, body_up], axis=1)
-        return cls(source_origin=pelvis, source_to_target_basis=basis)
+        return cls(source_origin=source_origin, source_to_target_basis=basis)
 
     @staticmethod
     def _frame_has_torso(points: np.ndarray) -> bool:
@@ -801,8 +814,14 @@ class FreeMoCapToGMRBridge:
                         if FreeMoCapXRobotConverter._frame_has_torso(points_m):
                             calibration_frames.append(points_m)
                         if len(calibration_frames) >= max(1, int(self.args.calibration_frames)):
-                            converter = FreeMoCapXRobotConverter.from_calibration_frames(calibration_frames)
-                            print(f"FreeMoCap calibration ready with {len(calibration_frames)} frames")
+                            converter = FreeMoCapXRobotConverter.from_calibration_frames(
+                                calibration_frames,
+                                preserve_ground_height=bool(self.args.preserve_ground_height),
+                            )
+                            print(
+                                f"FreeMoCap calibration ready with {len(calibration_frames)} frames "
+                                f"(preserve_ground_height={self.args.preserve_ground_height})"
+                            )
                             self._logged_calibration_ready = True
                         continue
 
@@ -1081,6 +1100,7 @@ class FreeMoCapToGMRBridge:
         print(f"  model_complexity: {self.args.model_complexity}")
         print(f"  parallel_camera_tracking: {self.args.parallel_camera_tracking}")
         print(f"  actual_human_height: {self.args.actual_human_height}")
+        print(f"  preserve_ground_height: {self.args.preserve_ground_height}")
         print(f"  gmr_max_iter: {self.args.gmr_max_iter}")
         print(f"  mock_gmr: {self.args.mock_gmr}")
         print(f"  mujoco_viewer: {self.args.mujoco_viewer}")
@@ -1157,6 +1177,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resize-width", type=int, default=None)
     parser.add_argument("--skip-triangulation-prewarm", action="store_true")
     parser.add_argument("--calibration-frames", type=int, default=30)
+    parser.add_argument("--preserve-ground-height", action="store_true")
     parser.add_argument("--actual-human-height", type=float, default=1.6)
     parser.add_argument("--gmr-max-iter", type=int, default=5)
     parser.add_argument("--mock-gmr", action="store_true")
