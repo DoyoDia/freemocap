@@ -188,6 +188,9 @@ TRANSLATIONS = {
         "human_height": "Human height",
         "model_complexity": "Model complexity",
         "parallel_tracking": "Parallel camera tracking",
+        "try_camera_orders": "Try camera orders",
+        "try_rotation_variants": "Try rotation variants",
+        "diagnostics_ransac": "RANSAC triangulation",
         "leg_width_scale": "Leg width scale",
         "min_valid_2d_ratio": "Minimum valid 2D ratio",
         "mujoco_viewer": "MuJoCo viewer",
@@ -338,7 +341,8 @@ class SkellycamLiveBridgeLauncher(QWidget):
         QTimer.singleShot(0, self._auto_fast_connect_if_enabled)
 
     def _tr(self, key: str, **kwargs) -> str:
-        template = TRANSLATIONS.get(self._language, TRANSLATIONS["zh"]).get(key, key)
+        language_table = TRANSLATIONS.get(self._language, TRANSLATIONS["zh"])
+        template = language_table.get(key, TRANSLATIONS["en"].get(key, key))
         return template.format(**kwargs) if kwargs else template
 
     def _build_language_controls(self) -> None:
@@ -453,6 +457,18 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._parallel_tracking_checkbox.setChecked(True)
         form.addRow("", self._parallel_tracking_checkbox)
 
+        self._try_camera_orders_checkbox = QCheckBox()
+        self._try_camera_orders_checkbox.setChecked(False)
+        form.addRow("", self._try_camera_orders_checkbox)
+
+        self._try_rotation_variants_checkbox = QCheckBox()
+        self._try_rotation_variants_checkbox.setChecked(False)
+        form.addRow("", self._try_rotation_variants_checkbox)
+
+        self._diagnostics_ransac_checkbox = QCheckBox()
+        self._diagnostics_ransac_checkbox.setChecked(False)
+        form.addRow("", self._diagnostics_ransac_checkbox)
+
         self._preserve_ground_height_checkbox = QCheckBox()
         self._preserve_ground_height_checkbox.setChecked(True)
         form.addRow("", self._preserve_ground_height_checkbox)
@@ -564,6 +580,9 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._human_height_label.setText(self._tr("human_height"))
         self._model_complexity_label.setText(self._tr("model_complexity"))
         self._parallel_tracking_checkbox.setText(self._tr("parallel_tracking"))
+        self._try_camera_orders_checkbox.setText(self._tr("try_camera_orders"))
+        self._try_rotation_variants_checkbox.setText(self._tr("try_rotation_variants"))
+        self._diagnostics_ransac_checkbox.setText(self._tr("diagnostics_ransac"))
         self._leg_width_scale_label.setText(self._tr("leg_width_scale"))
         self._min_valid_2d_ratio_label.setText(self._tr("min_valid_2d_ratio"))
         self._mujoco_viewer_checkbox.setText(self._tr("mujoco_viewer"))
@@ -641,6 +660,9 @@ class SkellycamLiveBridgeLauncher(QWidget):
             self._human_height_spin.setValue(float(settings.get("human_height", self._human_height_spin.value())))
             self._model_complexity_spin.setValue(int(settings.get("model_complexity", self._model_complexity_spin.value())))
             self._parallel_tracking_checkbox.setChecked(bool(settings.get("parallel_tracking", True)))
+            self._try_camera_orders_checkbox.setChecked(bool(settings.get("try_camera_orders", False)))
+            self._try_rotation_variants_checkbox.setChecked(bool(settings.get("try_rotation_variants", False)))
+            self._diagnostics_ransac_checkbox.setChecked(bool(settings.get("diagnostics_ransac", False)))
             self._preserve_ground_height_checkbox.setChecked(bool(settings.get("preserve_ground_height", True)))
             self._leg_width_scale_spin.setValue(float(settings.get("leg_width_scale", self._leg_width_scale_spin.value())))
             self._min_valid_2d_ratio_spin.setValue(
@@ -678,6 +700,9 @@ class SkellycamLiveBridgeLauncher(QWidget):
             "human_height": self._human_height_spin.value(),
             "model_complexity": self._model_complexity_spin.value(),
             "parallel_tracking": self._parallel_tracking_checkbox.isChecked(),
+            "try_camera_orders": self._try_camera_orders_checkbox.isChecked(),
+            "try_rotation_variants": self._try_rotation_variants_checkbox.isChecked(),
+            "diagnostics_ransac": self._diagnostics_ransac_checkbox.isChecked(),
             "preserve_ground_height": self._preserve_ground_height_checkbox.isChecked(),
             "leg_width_scale": self._leg_width_scale_spin.value(),
             "min_valid_2d_ratio": self._min_valid_2d_ratio_spin.value(),
@@ -1112,6 +1137,16 @@ class SkellycamLiveBridgeLauncher(QWidget):
         ]
         if self._parallel_tracking_checkbox.isChecked():
             args.append("--parallel-camera-tracking")
+        if self._try_camera_orders_checkbox.isChecked():
+            args.append("--try-camera-orders")
+        if self._try_rotation_variants_checkbox.isChecked():
+            args.append("--try-rotation-variants")
+        args.extend(
+            [
+                "--triangulate-method",
+                "ransac" if self._diagnostics_ransac_checkbox.isChecked() else "simple",
+            ]
+        )
 
         self._diagnostics_process = QProcess(self)
         self._diagnostics_process.setWorkingDirectory(str(REPO_ROOT))
@@ -1166,7 +1201,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         text = bytes(self._diagnostics_process.readAllStandardOutput()).decode("utf-8", errors="replace")
         for line in text.splitlines():
             self._append_log(line)
-            if line.startswith("[MocapDiagStats]"):
+            if line.startswith("[MocapDiag"):
                 self._status_label.setText(line)
 
     def _handle_diagnostics_stderr(self) -> None:

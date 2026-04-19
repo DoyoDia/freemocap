@@ -15,7 +15,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 import numpy as np
 
@@ -30,6 +30,8 @@ from realtime_mocap_probe import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MAX_CAMERA_SKEW_MS = 50.0
+SUPPORTED_TRIANGULATE_METHODS = ("simple", "ransac")
+SUPPORTED_ROTATION_DEGREES = (0, 90, 180, 270)
 
 
 def choose_skellycam_runtime_home(skellycam_home: Optional[Path] = None) -> Path:
@@ -87,6 +89,24 @@ def load_camera_config_json(camera_config_json: Optional[Path]) -> Dict[str, Dic
     if not isinstance(raw, dict):
         raise ValueError("--camera-config-json must contain a JSON object keyed by camera id.")
     return {str(camera_id): dict(config) for camera_id, config in raw.items()}
+
+
+def load_anipose_calibration(calibration_toml: Path) -> Any:
+    calibration_toml = calibration_toml.expanduser().resolve()
+    AniposeCameraGroup = _load_camera_group_class()
+    return AniposeCameraGroup.load(str(calibration_toml))
+
+
+def describe_calibration_cameras(calibration: Any) -> Dict[str, Any]:
+    cameras = list(getattr(calibration, "cameras", []))
+    return {
+        "camera_count": len(cameras),
+        "camera_names": [getattr(camera, "get_name", lambda: None)() for camera in cameras],
+        "camera_sizes": [
+            list(getattr(camera, "get_size", lambda: None)() or [])
+            for camera in cameras
+        ],
+    }
 
 
 def _build_camera_config_dictionary(
@@ -182,6 +202,120 @@ def _drain_latest_frames(camera_group: Any, camera_ids: Sequence[str], max_drain
     return latest
 
 
+def _normalize_triangulate_method(triangulate_method: str) -> str:
+    normalized = str(triangulate_method).strip().lower()
+    if normalized not in SUPPORTED_TRIANGULATE_METHODS:
+        raise ValueError(
+            f"triangulate_method must be one of {SUPPORTED_TRIANGULATE_METHODS}, got {triangulate_method!r}"
+        )
+    return normalized
+
+
+def triangulate_points_3d(calibration: Any, points_2d: np.ndarray, triangulate_method: str = "simple") -> np.ndarray:
+    triangulate_method = _normalize_triangulate_method(triangulate_method)
+    if triangulate_method == "ransac":
+        return calibration.triangulate_ransac(points_2d, progress=False)
+    return calibration.triangulate(points_2d, progress=False)
+
+
+def compute_reprojection_diagnostics(calibration: Any, points_3d: np.ndarray, points_2d: np.ndarray) -> Dict[str, Any]:
+    reprojection_mean_per_point = np.asarray(
+        calibration.reprojection_error(points_3d, points_2d, mean=True),
+        dtype=np.float32,
+    ).reshape(-1)
+    reprojection_vectors = np.asarray(
+        calibration.reprojection_error(points_3d, points_2d, mean=False),
+        dtype=np.float32,
+    )
+    if reprojection_vectors.ndim != 3 or reprojection_vectors.shape[-1] != 2:
+        raise ValueError(
+            f"Expected reprojection_error(mean=False) to return [camera, point, xy], got {reprojection_vectors.shape}"
+        )
+    reprojection_norms = np.linalg.norm(reprojection_vectors, axis=2)
+    per_camera_mean = np.nanmean(reprojection_norms, axis=1).astype(np.float32)
+    per_camera_max = np.nanmax(reprojection_norms, axis=1).astype(np.float32)
+    return {
+        "reprojection_error_px_mean_per_point": reprojection_mean_per_point,
+        "reprojection_error_px_mean": float(np.nanmean(reprojection_mean_per_point))
+        if np.isfinite(reprojection_mean_per_point).any()
+        else None,
+        "reprojection_error_px_max": float(np.nanmax(reprojection_norms))
+        if np.isfinite(reprojection_norms).any()
+        else None,
+        "per_camera_reprojection_error_px_mean": per_camera_mean,
+        "per_camera_reprojection_error_px_max": per_camera_max,
+    }
+
+
+def rotated_image_size(image_size: tuple[int, int], rotation_degrees: int) -> tuple[int, int]:
+    normalized = int(rotation_degrees) % 360
+    if normalized not in SUPPORTED_ROTATION_DEGREES:
+        raise ValueError(
+            f"rotation_degrees must be one of {SUPPORTED_ROTATION_DEGREES}, got {rotation_degrees!r}"
+        )
+    width, height = image_size
+    if normalized in {90, 270}:
+        return int(height), int(width)
+    return int(width), int(height)
+
+
+def rotate_points_2d(points_2d: np.ndarray, image_size: tuple[int, int], rotation_degrees: int) -> np.ndarray:
+    normalized = int(rotation_degrees) % 360
+    if normalized not in SUPPORTED_ROTATION_DEGREES:
+        raise ValueError(
+            f"rotation_degrees must be one of {SUPPORTED_ROTATION_DEGREES}, got {rotation_degrees!r}"
+        )
+    rotated = np.asarray(points_2d, dtype=np.float32).copy()
+    if normalized == 0 or rotated.size == 0:
+        return rotated
+
+    width, height = image_size
+    valid = np.isfinite(rotated).all(axis=1)
+    if not np.any(valid):
+        return rotated
+
+    xs = rotated[valid, 0].copy()
+    ys = rotated[valid, 1].copy()
+    if normalized == 90:
+        rotated[valid, 0] = float(height - 1) - ys
+        rotated[valid, 1] = xs
+    elif normalized == 180:
+        rotated[valid, 0] = float(width - 1) - xs
+        rotated[valid, 1] = float(height - 1) - ys
+    else:
+        rotated[valid, 0] = ys
+        rotated[valid, 1] = float(width - 1) - xs
+    return rotated
+
+
+def apply_camera_rotation_variants(
+    points_2d: np.ndarray,
+    image_sizes: Sequence[tuple[int, int]],
+    rotation_degrees_by_camera: Sequence[int],
+) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    points_2d = np.asarray(points_2d, dtype=np.float32)
+    if points_2d.ndim != 3 or points_2d.shape[-1] != 2:
+        raise ValueError(f"points_2d must have shape [camera, point, 2], got {points_2d.shape}")
+    if len(image_sizes) != points_2d.shape[0]:
+        raise ValueError("image_sizes length must match the number of cameras in points_2d")
+    if len(rotation_degrees_by_camera) != points_2d.shape[0]:
+        raise ValueError("rotation_degrees_by_camera length must match the number of cameras in points_2d")
+
+    transformed = np.empty_like(points_2d, dtype=np.float32)
+    transformed_sizes: list[tuple[int, int]] = []
+    for camera_index, (image_size, rotation_degrees) in enumerate(zip(image_sizes, rotation_degrees_by_camera)):
+        transformed[camera_index] = rotate_points_2d(points_2d[camera_index], image_size, rotation_degrees)
+        transformed_sizes.append(rotated_image_size(image_size, rotation_degrees))
+    return transformed, transformed_sizes
+
+
+def score_valid_3d_points(points_3d_mm: np.ndarray) -> float:
+    points_3d_mm = np.asarray(points_3d_mm)
+    if points_3d_mm.ndim != 2 or points_3d_mm.shape[1] != 3:
+        raise ValueError(f"points_3d_mm must have shape [point, 3], got {points_3d_mm.shape}")
+    return float(np.isfinite(points_3d_mm).all(axis=1).mean())
+
+
 def _track_and_triangulate_frame_set(
     frames: Sequence[np.ndarray],
     image_sizes: Sequence[tuple[int, int]],
@@ -192,6 +326,7 @@ def _track_and_triangulate_frame_set(
     parallel_camera_tracking: bool,
     camera_executor: Optional[ThreadPoolExecutor],
     include_holistic: bool = False,
+    triangulate_method: str = "simple",
 ) -> tuple[np.ndarray, float, Dict[str, Any]]:
     total_start = time.perf_counter()
     tracking_frames, tracking_image_sizes, scale_factors = resize_frames_for_tracking(frames, resize_width)
@@ -229,14 +364,25 @@ def _track_and_triangulate_frame_set(
     per_camera_valid_ratios = valid_points.mean(axis=1).astype(np.float32)
     points_2d = tracked_frame[:, :, :2].reshape(len(image_sizes), -1, 2)
     triangulate_start = time.perf_counter()
-    points_3d = calibration.triangulate(points_2d, progress=False).reshape(tracked_frame.shape[1], 3)
+    points_3d = triangulate_points_3d(
+        calibration=calibration,
+        points_2d=points_2d,
+        triangulate_method=triangulate_method,
+    ).reshape(tracked_frame.shape[1], 3)
     triangulate_end = time.perf_counter()
+    reprojection = compute_reprojection_diagnostics(
+        calibration=calibration,
+        points_3d=points_3d,
+        points_2d=points_2d,
+    )
     diagnostics = {
         "points_2d": points_2d.astype(np.float32, copy=False),
+        "triangulate_method": triangulate_method,
         "per_camera_2d_valid_ratios": per_camera_valid_ratios,
         "tracking_ms": (tracking_end - tracking_start) * 1000.0,
         "triangulate_3d_ms": (triangulate_end - triangulate_start) * 1000.0,
         "total_ms": (triangulate_end - total_start) * 1000.0,
+        **reprojection,
     }
     return points_3d.astype(np.float32, copy=False), valid_ratio, diagnostics
 
@@ -255,6 +401,7 @@ def iter_skellycam_mocap_3d_frames(
     resize_width: Optional[int] = None,
     include_holistic: bool = False,
     prewarm: bool = True,
+    triangulate_method: str = "simple",
     max_camera_skew_ms: float = DEFAULT_MAX_CAMERA_SKEW_MS,
     poll_sleep_s: float = 0.001,
     skellycam_importer: Callable[[Optional[Path]], tuple[type, type]] = _import_skellycam_bits,
@@ -270,13 +417,13 @@ def iter_skellycam_mocap_3d_frames(
         raise ValueError("max_camera_skew_ms must be positive")
     if tracker not in {"pose", "holistic"}:
         raise ValueError("tracker must be 'pose' or 'holistic'")
+    triangulate_method = _normalize_triangulate_method(triangulate_method)
 
     calibration_toml = calibration_toml.expanduser().resolve()
     if not calibration_toml.exists():
         raise FileNotFoundError(f"Calibration TOML not found: {calibration_toml}")
 
-    AniposeCameraGroup = _load_camera_group_class()
-    calibration = AniposeCameraGroup.load(str(calibration_toml))
+    calibration = load_anipose_calibration(calibration_toml)
     expected_camera_count = len(calibration.cameras)
     if prewarm:
         prewarm_triangulation(calibration, num_cameras=expected_camera_count)
@@ -331,6 +478,7 @@ def iter_skellycam_mocap_3d_frames(
                 parallel_camera_tracking=parallel_camera_tracking,
                 camera_executor=camera_executor,
                 include_holistic=include_holistic,
+                triangulate_method=triangulate_method,
             )
             timestamp_ns = int(max(float(getattr(payload, "timestamp_ns")) for payload in ordered_payloads))
             if diagnostics_callback is not None:

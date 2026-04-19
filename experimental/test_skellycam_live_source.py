@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Queue
 
 import numpy as np
 
+import skellycam_mocap_diagnostics as diagnostics
 import skellycam_live_source as live_source
 
 
@@ -69,6 +71,14 @@ def test_live_source_fake_frame_payload_yields_mocap_frame(monkeypatch) -> None:
         def triangulate(self, points, progress=False):
             assert points.shape == (2, 33, 2)
             return np.arange(99, dtype=np.float32).reshape(33, 3)
+
+        def triangulate_ransac(self, points, progress=False):
+            return self.triangulate(points, progress=progress)
+
+        def reprojection_error(self, points_3d, points_2d, mean=False):
+            if mean:
+                return np.full(points_2d.shape[1], 2.0, dtype=np.float32)
+            return np.zeros((points_2d.shape[0], points_2d.shape[1], 2), dtype=np.float32)
 
     class FakeAniposeCameraGroup:
         @staticmethod
@@ -140,3 +150,73 @@ def test_live_source_fake_frame_payload_yields_mocap_frame(monkeypatch) -> None:
     assert frames[0].timestamp_ns == 1_010_000_000
     assert frames[0].points_3d.shape == (33, 3)
     assert frames[0].valid_2d_point_ratio == 1.0
+
+
+def test_rotate_points_2d_90_clockwise() -> None:
+    points = np.asarray([[0.0, 0.0], [10.0, 20.0], [np.nan, 5.0]], dtype=np.float32)
+    rotated = live_source.rotate_points_2d(points, image_size=(100, 50), rotation_degrees=90)
+
+    assert np.allclose(rotated[0], [49.0, 0.0])
+    assert np.allclose(rotated[1], [29.0, 10.0])
+    assert np.isnan(rotated[2]).any()
+
+
+def test_apply_camera_rotation_variants_updates_sizes() -> None:
+    points = np.zeros((2, 3, 2), dtype=np.float32)
+    rotated_points, rotated_sizes = live_source.apply_camera_rotation_variants(
+        points_2d=points,
+        image_sizes=[(1920, 1080), (640, 480)],
+        rotation_degrees_by_camera=[0, 270],
+    )
+
+    assert rotated_points.shape == points.shape
+    assert rotated_sizes == [(1920, 1080), (480, 640)]
+
+
+def test_replace_latest_queue_item_keeps_only_latest() -> None:
+    latest_queue: Queue[int] = Queue(maxsize=1)
+
+    diagnostics.replace_latest_queue_item(latest_queue, 1)
+    diagnostics.replace_latest_queue_item(latest_queue, 2)
+
+    assert latest_queue.qsize() == 1
+    assert latest_queue.get_nowait() == 2
+
+
+def test_plausibility_metrics_and_likely_cause() -> None:
+    points_m = np.full((33, 3), np.nan, dtype=np.float32)
+    points_m[diagnostics.MEDIAPIPE["nose"]] = [0.0, 1.7, 0.0]
+    points_m[diagnostics.MEDIAPIPE["left_ear"]] = [-0.05, 1.65, 0.0]
+    points_m[diagnostics.MEDIAPIPE["right_ear"]] = [0.05, 1.65, 0.0]
+    points_m[diagnostics.MEDIAPIPE["left_shoulder"]] = [-0.2, 1.45, 0.0]
+    points_m[diagnostics.MEDIAPIPE["right_shoulder"]] = [0.2, 1.45, 0.0]
+    points_m[diagnostics.MEDIAPIPE["left_hip"]] = [-0.15, 1.0, 0.0]
+    points_m[diagnostics.MEDIAPIPE["right_hip"]] = [0.15, 1.0, 0.0]
+    points_m[diagnostics.MEDIAPIPE["left_knee"]] = [-0.15, 0.55, 0.0]
+    points_m[diagnostics.MEDIAPIPE["right_knee"]] = [0.15, 0.55, 0.0]
+    points_m[diagnostics.MEDIAPIPE["left_ankle"]] = [-0.15, 0.12, 0.0]
+    points_m[diagnostics.MEDIAPIPE["right_ankle"]] = [0.15, 0.12, 0.0]
+    points_m[diagnostics.MEDIAPIPE["left_heel"]] = [-0.15, 0.04, -0.04]
+    points_m[diagnostics.MEDIAPIPE["right_heel"]] = [0.15, 0.04, -0.04]
+    points_m[diagnostics.MEDIAPIPE["left_foot_index"]] = [-0.15, 0.04, 0.16]
+    points_m[diagnostics.MEDIAPIPE["right_foot_index"]] = [0.15, 0.04, 0.16]
+
+    plausibility = diagnostics._plausibility_metrics(points_m)
+
+    assert plausibility["height_plausible"] is True
+    assert plausibility["segment_plausible"] is True
+    assert plausibility["plausible_metric_ratio"] is not None
+    assert plausibility["plausible_metric_ratio"] > 0.8
+
+    likely_cause = diagnostics.classify_likely_cause(
+        {
+            "valid_2d_point_ratio_mean": 0.98,
+            "reprojection_error_px_mean_mean": 28.0,
+            "plausible_metric_ratio_mean": 0.9,
+            "camera_skew_ms_mean": 10.0,
+            "camera_skew_ms_max": 12.0,
+        },
+        max_camera_skew_ms=50.0,
+    )
+
+    assert likely_cause == "calibration_or_camera_order_or_rotation_mismatch"
