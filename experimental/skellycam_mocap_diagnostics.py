@@ -175,6 +175,48 @@ def _mean_optional(values: Iterable[Optional[float]]) -> Optional[float]:
     return float(np.mean(valid))
 
 
+def _robust_height_estimate(points_m: np.ndarray) -> Optional[float]:
+    head = _head_point(points_m)
+    if not _finite_point(head):
+        return None
+
+    lower_points = [
+        _point(points_m, name)
+        for name in (
+            "left_ankle",
+            "right_ankle",
+            "left_heel",
+            "right_heel",
+            "left_foot_index",
+            "right_foot_index",
+        )
+    ]
+    lower_ys = [float(point[1]) for point in lower_points if _finite_point(point)]
+    if not lower_ys:
+        return None
+
+    # Use the median lower-body height to avoid a single exploded foot/heel point
+    # making the displayed body height meaningless.
+    floor_y = float(np.median(np.asarray(lower_ys, dtype=np.float64)))
+    return float(head[1] - floor_y)
+
+
+def _body_axis_spans(points_m: np.ndarray) -> Dict[str, Optional[float]]:
+    finite_points = points_m[np.isfinite(points_m).all(axis=1)]
+    if finite_points.size == 0:
+        return {
+            "body_span_x_m": None,
+            "body_span_y_m": None,
+            "body_span_z_m": None,
+        }
+    spans = np.nanmax(finite_points, axis=0) - np.nanmin(finite_points, axis=0)
+    return {
+        "body_span_x_m": float(spans[0]),
+        "body_span_y_m": float(spans[1]),
+        "body_span_z_m": float(spans[2]),
+    }
+
+
 def _as_jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -233,7 +275,6 @@ def _segment_metrics(points_m: np.ndarray) -> Dict[str, Optional[float]]:
         right_foot = _distance(points_m, "right_ankle", "right_foot_index")
     shoulder_width = _distance(points_m, "left_shoulder", "right_shoulder")
     hip_width = _distance(points_m, "left_hip", "right_hip")
-    head_to_pelvis = _distance_between(_head_point(points_m), _midpoint(points_m, "left_hip", "right_hip"))
     left_leg = _mean_optional(
         [
             _distance(points_m, "left_hip", "left_knee"),
@@ -248,18 +289,10 @@ def _segment_metrics(points_m: np.ndarray) -> Dict[str, Optional[float]]:
             _distance(points_m, "right_ankle", "right_heel"),
         ]
     )
-    estimated_height = None
-    if head_to_pelvis is not None:
-        leg_proxy = _mean_optional(
-            [
-                None if left_thigh is None or left_shin is None else left_thigh + left_shin + (_distance(points_m, "left_ankle", "left_heel") or 0.0),
-                None if right_thigh is None or right_shin is None else right_thigh + right_shin + (_distance(points_m, "right_ankle", "right_heel") or 0.0),
-            ]
-        )
-        if leg_proxy is not None:
-            estimated_height = float(head_to_pelvis + leg_proxy)
+    estimated_height = _robust_height_estimate(points_m)
 
     max_abs_point_m = float(np.nanmax(np.abs(points_m))) if np.isfinite(points_m).any() else None
+    axis_spans = _body_axis_spans(points_m)
     return {
         "estimated_height_m": estimated_height,
         "shoulder_width_m": shoulder_width,
@@ -273,6 +306,7 @@ def _segment_metrics(points_m: np.ndarray) -> Dict[str, Optional[float]]:
         "max_abs_point_m": max_abs_point_m,
         "left_leg_proxy_m": left_leg,
         "right_leg_proxy_m": right_leg,
+        **axis_spans,
     }
 
 
@@ -627,12 +661,25 @@ def _evaluate_candidate_on_samples(
     mean_reprojection = float(np.mean(reprojection_means)) if reprojection_means else None
     mean_valid_3d_ratio = float(np.mean(valid_3d_ratios)) if valid_3d_ratios else 0.0
     mean_plausible_ratio = float(np.mean(plausible_metric_ratios)) if plausible_metric_ratios else 0.0
-    reprojection_score = 0.0 if mean_reprojection is None else float(1.0 / (1.0 + (mean_reprojection / 10.0)))
+    height_plausible_ratio = float(height_plausible_count / frame_count)
+    segment_plausible_ratio = float(segment_plausible_count / frame_count)
+    reprojection_score = 0.0 if mean_reprojection is None else float(1.0 / (1.0 + (mean_reprojection / 25.0)))
+
+    # Candidate selection should be dominated by reprojection quality first.
+    # Human-scale plausibility is still helpful, but it must not overpower a
+    # 10x worse reprojection error and recommend a geometrically worse setup.
     composite_score = (
-        0.35 * mean_valid_3d_ratio
-        + 0.35 * reprojection_score
-        + 0.15 * (height_plausible_count / frame_count)
-        + 0.15 * mean_plausible_ratio
+        0.55 * reprojection_score
+        + 0.15 * mean_valid_3d_ratio
+        + 0.15 * height_plausible_ratio
+        + 0.15 * segment_plausible_ratio
+    )
+    ranking_cost = (
+        (mean_reprojection if mean_reprojection is not None else 1e6)
+        + (1.0 - height_plausible_ratio) * 100.0
+        + (1.0 - segment_plausible_ratio) * 100.0
+        + (1.0 - mean_plausible_ratio) * 50.0
+        + (1.0 - mean_valid_3d_ratio) * 200.0
     )
     return {
         "label": label,
@@ -642,10 +689,11 @@ def _evaluate_candidate_on_samples(
         "reprojection_error_px_mean_mean": mean_reprojection,
         "reprojection_error_px_max_max": float(np.max(reprojection_maxes)) if reprojection_maxes else None,
         "valid_3d_frame_ratio": mean_valid_3d_ratio,
-        "height_plausible_frame_ratio": float(height_plausible_count / frame_count),
-        "segment_plausible_frame_ratio": float(segment_plausible_count / frame_count),
+        "height_plausible_frame_ratio": height_plausible_ratio,
+        "segment_plausible_frame_ratio": segment_plausible_ratio,
         "plausible_metric_ratio_mean": mean_plausible_ratio,
         "composite_score": composite_score,
+        "ranking_cost": ranking_cost,
     }
 
 
@@ -688,16 +736,16 @@ def _evaluate_camera_orders(
             f"segment_ok={result['segment_plausible_frame_ratio']:.3f}",
             flush=True,
         )
-    best = max(
+    best = min(
         candidates,
         key=lambda item: (
-            item["composite_score"],
-            item["valid_3d_frame_ratio"],
-            -(item["reprojection_error_px_mean_mean"] or float("inf")),
+            item["ranking_cost"],
+            item["reprojection_error_px_mean_mean"] or float("inf"),
+            -item["composite_score"],
         ),
     )
     print(
-        f"[MocapDiagRecommend] recommended_camera_order={best['label']} score={best['composite_score']:.3f}",
+        f"[MocapDiagRecommend] recommended_camera_order={best['label']} score={best['composite_score']:.3f} cost={best['ranking_cost']:.3f}",
         flush=True,
     )
     return {
@@ -744,16 +792,16 @@ def _evaluate_rotation_variants(
                 flush=True,
             )
 
-    best = max(
+    best = min(
         candidates,
         key=lambda item: (
-            item["composite_score"],
-            item["valid_3d_frame_ratio"],
-            -(item["reprojection_error_px_mean_mean"] or float("inf")),
+            item["ranking_cost"],
+            item["reprojection_error_px_mean_mean"] or float("inf"),
+            -item["composite_score"],
         ),
     )
     print(
-        f"[MocapDiagRecommend] recommended_rotation_variant={best['label']} score={best['composite_score']:.3f}",
+        f"[MocapDiagRecommend] recommended_rotation_variant={best['label']} score={best['composite_score']:.3f} cost={best['ranking_cost']:.3f}",
         flush=True,
     )
     return {
@@ -895,7 +943,7 @@ def _viewer_process_main(packet_queue: Any, viewer_range_m: float, follow_pelvis
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("Skellycam 3D mocap diagnostics")
-            self.resize(960, 700)
+            self.resize(1380, 740)
             layout = QVBoxLayout(self)
             self.overlay = QLabel()
             self.overlay.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -907,9 +955,9 @@ def _viewer_process_main(packet_queue: Any, viewer_range_m: float, follow_pelvis
             layout.addWidget(self.view, stretch=1)
             self._latest_packet: Optional[Dict[str, Any]] = None
             self._last_sane_center = np.zeros(3, dtype=np.float64)
+            self._last_sane_half_ranges = np.asarray([2.2, 1.8, 2.0], dtype=np.float64)
             self._follow_pelvis = bool(follow_pelvis)
             self._viewer_range_m = max(float(viewer_range_m), DEFAULT_VIEWER_RANGE_M)
-            self._z_range_m = max(3.0, self._viewer_range_m * 0.75)
 
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._poll_and_render)
@@ -928,33 +976,68 @@ def _viewer_process_main(packet_queue: Any, viewer_range_m: float, follow_pelvis
             if self._latest_packet is not None:
                 self._render_packet(self._latest_packet)
 
-        def _select_center(self, points_m: np.ndarray, max_abs_point_m: Optional[float]) -> np.ndarray:
-            if max_abs_point_m is not None and max_abs_point_m > 10.0:
-                return self._last_sane_center
+        def _select_center(self, points_m: np.ndarray, max_abs_point_m: Optional[float], allow_persist: bool) -> np.ndarray:
             pelvis = _midpoint(points_m, "left_hip", "right_hip")
             if self._follow_pelvis and _finite_point(pelvis):
-                self._last_sane_center = pelvis
+                if allow_persist:
+                    self._last_sane_center = pelvis
                 return pelvis
             finite_points = points_m[np.isfinite(points_m).all(axis=1)]
             if finite_points.size:
                 center = np.nanmean(finite_points, axis=0)
-                self._last_sane_center = center
+                if allow_persist:
+                    self._last_sane_center = center
                 return center
             return self._last_sane_center
 
-        def _project(self, point: np.ndarray, center: np.ndarray, view_kind: str, rect: tuple[float, float, float, float]) -> Optional[tuple[float, float]]:
+        def _select_half_ranges(
+            self,
+            points_m: np.ndarray,
+            center: np.ndarray,
+            allow_persist: bool,
+        ) -> np.ndarray:
+            finite_points = points_m[np.isfinite(points_m).all(axis=1)]
+            if finite_points.size == 0:
+                return self._last_sane_half_ranges
+
+            relative = finite_points - center
+            robust_low = np.percentile(relative, 5.0, axis=0)
+            robust_high = np.percentile(relative, 95.0, axis=0)
+            half_ranges = np.maximum(
+                (robust_high - robust_low) * 0.65,
+                np.asarray([self._viewer_range_m * 0.45, 1.6, 1.6], dtype=np.float64),
+            )
+            half_ranges = np.minimum(half_ranges, np.asarray([4.0, 3.0, 4.0], dtype=np.float64))
+            if allow_persist:
+                self._last_sane_half_ranges = half_ranges.astype(np.float64)
+            return half_ranges.astype(np.float64)
+
+        def _project(
+            self,
+            point: np.ndarray,
+            center: np.ndarray,
+            half_ranges: np.ndarray,
+            view_kind: str,
+            rect: tuple[float, float, float, float],
+        ) -> Optional[tuple[float, float]]:
             if not _finite_point(point):
                 return None
             left, top, width, height = rect
-            x_half = self._viewer_range_m / 2.0
-            y_half = self._viewer_range_m / 2.0
-            z_half = self._z_range_m / 2.0
+            x_half = max(float(half_ranges[0]), 1e-6)
+            y_half = max(float(half_ranges[1]), 1e-6)
+            z_half = max(float(half_ranges[2]), 1e-6)
+            dx = (point[0] - center[0]) / x_half
+            dy = (point[1] - center[1]) / y_half
+            dz = (point[2] - center[2]) / z_half
             if view_kind == "front":
-                horizontal = (point[0] - center[0]) / max(x_half, 1e-6)
-                vertical = (point[1] - center[1]) / max(y_half, 1e-6)
+                horizontal = dx
+                vertical = dy
+            elif view_kind == "side":
+                horizontal = dz
+                vertical = dy
             else:
-                horizontal = (point[2] - center[2]) / max(z_half, 1e-6)
-                vertical = (point[1] - center[1]) / max(y_half, 1e-6)
+                horizontal = (0.72 * dx) - (0.72 * dz)
+                vertical = dy - (0.24 * dx) - (0.18 * dz)
             px = left + ((horizontal + 1.0) * 0.5 * width)
             py = top + ((1.0 - (vertical + 1.0) * 0.5) * height)
             return px, py
@@ -962,17 +1045,22 @@ def _viewer_process_main(packet_queue: Any, viewer_range_m: float, follow_pelvis
         def _render_packet(self, packet: Dict[str, Any]) -> None:
             points_m = np.asarray(packet["points_m"], dtype=np.float32).reshape(33, 3)
             max_abs_point_m = packet.get("max_abs_point_m")
-            center = self._select_center(points_m, max_abs_point_m)
+            allow_persist = not (max_abs_point_m is not None and max_abs_point_m > 10.0)
+            center = self._select_center(points_m, max_abs_point_m, allow_persist=allow_persist)
+            half_ranges = self._select_half_ranges(points_m, center, allow_persist=allow_persist)
             self.scene.clear()
-            scene_width = 900.0
+            scene_width = 1360.0
             scene_height = 560.0
             self.scene.setSceneRect(0.0, 0.0, scene_width, scene_height)
-            front_rect = (20.0, 20.0, 400.0, 520.0)
-            side_rect = (480.0, 20.0, 400.0, 520.0)
+            front_rect = (20.0, 20.0, 420.0, 520.0)
+            side_rect = (470.0, 20.0, 420.0, 520.0)
+            iso_rect = (920.0, 20.0, 420.0, 520.0)
             self.scene.addRect(*front_rect, pen=QPen(QColor("#555555")))
             self.scene.addRect(*side_rect, pen=QPen(QColor("#555555")))
+            self.scene.addRect(*iso_rect, pen=QPen(QColor("#555555")))
             self.scene.addText("Front X/Y").setPos(front_rect[0], 0.0)
             self.scene.addText("Side Z/Y").setPos(side_rect[0], 0.0)
+            self.scene.addText("Composite View").setPos(iso_rect[0], 0.0)
 
             def point_color(index: int) -> QColor:
                 if index in {11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31}:
@@ -981,12 +1069,12 @@ def _viewer_process_main(packet_queue: Any, viewer_range_m: float, follow_pelvis
                     return QColor("#d62728")
                 return QColor("#888888")
 
-            for rect, view_kind in ((front_rect, "front"), (side_rect, "side")):
+            for rect, view_kind in ((front_rect, "front"), (side_rect, "side"), (iso_rect, "iso")):
                 for start_name, end_name in SKELETON_EDGES:
                     start = _point(points_m, start_name)
                     end = _point(points_m, end_name)
-                    start_xy = self._project(start, center, view_kind, rect)
-                    end_xy = self._project(end, center, view_kind, rect)
+                    start_xy = self._project(start, center, half_ranges, view_kind, rect)
+                    end_xy = self._project(end, center, half_ranges, view_kind, rect)
                     if start_xy is None or end_xy is None:
                         continue
                     self.scene.addLine(
@@ -997,7 +1085,7 @@ def _viewer_process_main(packet_queue: Any, viewer_range_m: float, follow_pelvis
                         pen=QPen(QColor("#4c78a8"), 2.0),
                     )
                 for index, point in enumerate(points_m):
-                    projected = self._project(point, center, view_kind, rect)
+                    projected = self._project(point, center, half_ranges, view_kind, rect)
                     if projected is None:
                         continue
                     radius = 4.0
@@ -1009,6 +1097,7 @@ def _viewer_process_main(packet_queue: Any, viewer_range_m: float, follow_pelvis
                         pen=QPen(point_color(index)),
                         brush=point_color(index),
                     )
+            self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
             warning = ""
             if max_abs_point_m is not None and max_abs_point_m > 10.0:
@@ -1023,6 +1112,7 @@ def _viewer_process_main(packet_queue: Any, viewer_range_m: float, follow_pelvis
                         f"height={packet.get('estimated_height_m')}",
                         f"problem={packet.get('last_problem')}",
                         f"order={packet.get('camera_order_label')}",
+                        f"ranges=({half_ranges[0]:.1f},{half_ranges[1]:.1f},{half_ranges[2]:.1f})",
                         warning.strip(),
                     ]
                     if part

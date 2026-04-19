@@ -220,3 +220,45 @@ def test_plausibility_metrics_and_likely_cause() -> None:
     )
 
     assert likely_cause == "calibration_or_camera_order_or_rotation_mismatch"
+
+
+def test_robust_height_estimate_ignores_single_bad_foot_point() -> None:
+    points_m = np.full((33, 3), np.nan, dtype=np.float32)
+    points_m[diagnostics.MEDIAPIPE["nose"]] = [0.0, 1.9, 0.0]
+    points_m[diagnostics.MEDIAPIPE["left_ear"]] = [-0.05, 1.85, 0.0]
+    points_m[diagnostics.MEDIAPIPE["right_ear"]] = [0.05, 1.85, 0.0]
+    points_m[diagnostics.MEDIAPIPE["left_ankle"]] = [-0.1, 0.05, 0.0]
+    points_m[diagnostics.MEDIAPIPE["right_ankle"]] = [0.1, 0.05, 0.0]
+    points_m[diagnostics.MEDIAPIPE["left_heel"]] = [-0.1, 0.03, 0.0]
+    points_m[diagnostics.MEDIAPIPE["right_heel"]] = [0.1, 0.03, 0.0]
+    points_m[diagnostics.MEDIAPIPE["left_foot_index"]] = [-0.1, 0.02, 0.15]
+    points_m[diagnostics.MEDIAPIPE["right_foot_index"]] = [0.1, -8.0, 0.15]
+
+    estimated_height = diagnostics._robust_height_estimate(points_m)
+
+    assert estimated_height is not None
+    assert 1.7 < estimated_height < 2.1
+
+
+def test_candidate_scoring_prefers_lower_reprojection() -> None:
+    better = {
+        "ranking_cost": 275.0,
+        "reprojection_error_px_mean_mean": 25.0,
+        "composite_score": 0.44,
+    }
+    worse = {
+        "ranking_cost": 282.6,
+        "reprojection_error_px_mean_mean": 282.6,
+        "composite_score": 0.66,
+    }
+
+    best = min(
+        [better, worse],
+        key=lambda item: (
+            item["ranking_cost"],
+            item["reprojection_error_px_mean_mean"] or float("inf"),
+            -item["composite_score"],
+        ),
+    )
+
+    assert best is better
