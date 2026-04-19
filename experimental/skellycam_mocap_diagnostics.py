@@ -32,6 +32,7 @@ from skellycam_live_source import (
     load_anipose_calibration,
     load_camera_config_json,
     parse_camera_ids,
+    rotated_image_size,
     score_valid_3d_points,
     triangulate_points_3d,
 )
@@ -124,6 +125,19 @@ DEFAULT_BAD_REPROJECTION_ERROR_PX = 15.0
 DEFAULT_VIEWER_RANGE_M = 4.0
 DEFAULT_ORDER_TEST_FRAMES = 120
 DEFAULT_ROTATION_TEST_FRAMES = 60
+ROTATE_NONE_CODE = -1
+ROTATION_CODE_TO_DEGREES = {
+    -1: 0,
+    0: 90,
+    1: 180,
+    2: 270,
+}
+ROTATION_CODE_LABELS = {
+    -1: "none",
+    0: "90_clockwise",
+    1: "180",
+    2: "90_counterclockwise",
+}
 
 
 def _default_output_folder() -> Path:
@@ -417,6 +431,25 @@ def _rotation_variant_label(rotation_degrees_by_camera: Sequence[int]) -> str:
     return ",".join(str(int(value)) for value in rotation_degrees_by_camera)
 
 
+def _rotation_code_degrees(rotation_code: Any) -> Optional[int]:
+    if rotation_code is None:
+        return None
+    try:
+        return ROTATION_CODE_TO_DEGREES[int(rotation_code)]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _rotation_code_label(rotation_code: Any) -> str:
+    if rotation_code is None:
+        return "unknown"
+    try:
+        rotation_int = int(rotation_code)
+    except (TypeError, ValueError):
+        return str(rotation_code)
+    return ROTATION_CODE_LABELS.get(rotation_int, str(rotation_int))
+
+
 def classify_likely_cause(summary: Dict[str, Any], max_camera_skew_ms: float) -> str:
     valid_ratio = summary.get("valid_2d_point_ratio_mean")
     reprojection_mean = summary.get("reprojection_error_px_mean_mean")
@@ -492,11 +525,20 @@ def _build_startup_consistency_report(
         if calibration_size and width is not None and height is not None:
             if [int(width), int(height)] != [int(calibration_size[0]), int(calibration_size[1])]:
                 warnings.append(
-                    f"camera {index} live resolution {width}x{height} differs from calibration {calibration_size[0]}x{calibration_size[1]}"
+                    f"camera {camera_info['camera_id']} live resolution {width}x{height} differs from calibration "
+                    f"{calibration_size[0]}x{calibration_size[1]}"
                 )
-        if camera_info.get("rotate_video_cv2_code") not in {None, 0}:
+        rotation_code = camera_info.get("rotate_video_cv2_code")
+        rotation_degrees = _rotation_code_degrees(rotation_code)
+        if rotation_code not in {None, ROTATE_NONE_CODE}:
+            rotation_warning = (
+                f"camera {camera_info['camera_id']} rotates frames with OpenCV code "
+                f"{rotation_code} ({_rotation_code_label(rotation_code)})"
+            )
+            if rotation_degrees in {90, 270}:
+                rotation_warning += "; displayed/saved frame width and height will be swapped"
             warnings.append(
-                f"camera {camera_info['camera_id']} has non-default rotation {camera_info.get('rotate_video_cv2_code')}"
+                rotation_warning
             )
 
     return {
@@ -523,6 +565,50 @@ def _print_startup_report(report: Dict[str, Any]) -> None:
         )
     for warning in report["warnings"]:
         print(f"[MocapDiagWarning] {warning}", flush=True)
+
+
+def _actual_image_size_warnings(
+    samples: Sequence[Dict[str, Any]],
+    camera_ids: Sequence[str],
+    camera_configs: Dict[str, Dict[str, Any]],
+    calibration_summary: Dict[str, Any],
+) -> list[str]:
+    if not samples:
+        return []
+
+    first_sizes = list(samples[0].get("image_sizes", []))
+    warnings: list[str] = []
+    for index, (camera_id, actual_size) in enumerate(zip(camera_ids, first_sizes)):
+        actual_width, actual_height = int(actual_size[0]), int(actual_size[1])
+        config = camera_configs.get(str(camera_id), {})
+        requested_width = config.get("resolution_width")
+        requested_height = config.get("resolution_height")
+        calibration_sizes = calibration_summary.get("camera_sizes", [])
+        calibration_size = calibration_sizes[index] if index < len(calibration_sizes) else None
+        rotation_code = config.get("rotate_video_cv2_code")
+        rotation_degrees = _rotation_code_degrees(rotation_code)
+
+        if requested_width is not None and requested_height is not None:
+            if [actual_width, actual_height] != [int(requested_width), int(requested_height)]:
+                message = (
+                    f"camera {camera_id} actual frame size is {actual_width}x{actual_height}, "
+                    f"not the requested {requested_width}x{requested_height}"
+                )
+                if rotation_degrees in {90, 270}:
+                    raw_width, raw_height = rotated_image_size((actual_width, actual_height), rotation_degrees)
+                    message += (
+                        f"; after undoing the configured {_rotation_code_label(rotation_code)} rotation, "
+                        f"the camera likely delivered about {raw_width}x{raw_height}"
+                    )
+                warnings.append(message)
+
+        if calibration_size:
+            if [actual_width, actual_height] != [int(calibration_size[0]), int(calibration_size[1])]:
+                warnings.append(
+                    f"camera {camera_id} actual frame size {actual_width}x{actual_height} differs from calibration "
+                    f"{calibration_size[0]}x{calibration_size[1]}"
+                )
+    return warnings
 
 
 def _source_generator_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
@@ -1269,6 +1355,15 @@ def _run_preflight_recommendations(args: argparse.Namespace, calibration: Any, c
     if not samples:
         print("[MocapDiagWarning] preflight could not collect enough valid samples", flush=True)
         return recommendations
+
+    actual_size_warnings = _actual_image_size_warnings(
+        samples=samples,
+        camera_ids=camera_ids,
+        camera_configs=load_camera_config_json(args.camera_config_json),
+        calibration_summary=describe_calibration_cameras(calibration),
+    )
+    for warning in actual_size_warnings:
+        print(f"[MocapDiagWarning] {warning}", flush=True)
 
     selected_order_indices = list(range(len(camera_ids)))
     if args.try_camera_orders:

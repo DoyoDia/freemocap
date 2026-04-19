@@ -23,6 +23,23 @@ class FakeCameraConfig:
         return FakeCameraConfig(**data)
 
 
+class _FakeCalibrationCamera:
+    def __init__(self, name: str, size: tuple[int, int]):
+        self._name = name
+        self._size = size
+
+    def get_name(self):
+        return self._name
+
+    def get_size(self):
+        return self._size
+
+
+class _FakeCalibration:
+    def __init__(self, cameras):
+        self.cameras = cameras
+
+
 def test_build_camera_config_dictionary_respects_explicit_order() -> None:
     camera_ids, configs = live_source._build_camera_config_dictionary(
         camera_ids=["1", "0"],
@@ -262,3 +279,75 @@ def test_candidate_scoring_prefers_lower_reprojection() -> None:
     )
 
     assert best is better
+
+
+def test_build_startup_consistency_report_warns_for_rotated_camera_two() -> None:
+    calibration = _FakeCalibration(
+        [
+            _FakeCalibrationCamera("Camera_000_synchronized", (1920, 1080)),
+            _FakeCalibrationCamera("Camera_001_synchronized", (480, 640)),
+        ]
+    )
+    camera_configs = {
+        "1": {
+            "camera_id": "1",
+            "resolution_width": 1920,
+            "resolution_height": 1080,
+            "framerate": 30,
+            "fourcc": "MJPG",
+            "exposure": -5,
+            "rotate_video_cv2_code": -1,
+        },
+        "2": {
+            "camera_id": "2",
+            "resolution_width": 1920,
+            "resolution_height": 1080,
+            "framerate": 30,
+            "fourcc": "MJPG",
+            "exposure": -5,
+            "rotate_video_cv2_code": 0,
+        },
+    }
+
+    report = diagnostics._build_startup_consistency_report(calibration, ["1", "2"], camera_configs)
+
+    assert any("camera 2 live resolution 1920x1080 differs from calibration 480x640" in warning for warning in report["warnings"])
+    assert any("camera 2 rotates frames" in warning for warning in report["warnings"])
+    assert all("camera 1 rotates frames" not in warning for warning in report["warnings"])
+
+
+def test_actual_image_size_warnings_identify_rotated_low_resolution_stream() -> None:
+    calibration_summary = {
+        "camera_count": 2,
+        "camera_names": ["Camera_000_synchronized", "Camera_001_synchronized"],
+        "camera_sizes": [[1920, 1080], [480, 640]],
+    }
+    camera_configs = {
+        "1": {
+            "camera_id": "1",
+            "resolution_width": 1920,
+            "resolution_height": 1080,
+            "rotate_video_cv2_code": -1,
+        },
+        "2": {
+            "camera_id": "2",
+            "resolution_width": 1920,
+            "resolution_height": 1080,
+            "rotate_video_cv2_code": 0,
+        },
+    }
+    samples = [
+        {
+            "image_sizes": [(1920, 1080), (480, 640)],
+        }
+    ]
+
+    warnings = diagnostics._actual_image_size_warnings(
+        samples=samples,
+        camera_ids=["1", "2"],
+        camera_configs=camera_configs,
+        calibration_summary=calibration_summary,
+    )
+
+    assert any("camera 2 actual frame size is 480x640" in warning for warning in warnings)
+    assert any("likely delivered about 640x480" in warning for warning in warnings)
