@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import time
 from collections import Counter, deque
@@ -280,11 +281,12 @@ def _compute_frame_metrics(
 
 
 class SkeletonViewer:
-    def __init__(self, viewer_range_m: float) -> None:
+    def __init__(self, viewer_range_m: float, follow_pelvis: bool) -> None:
         import matplotlib.pyplot as plt
 
         self.plt = plt
         self.viewer_range_m = float(viewer_range_m)
+        self.follow_pelvis = bool(follow_pelvis)
         self.center: Optional[np.ndarray] = None
         self.plt.ion()
         self.fig = self.plt.figure("Skellycam 3D mocap diagnostics")
@@ -298,8 +300,8 @@ class SkeletonViewer:
     def is_open(self) -> bool:
         return bool(self.plt.fignum_exists(self.fig.number))
 
-    def _lock_axes(self, points_m: np.ndarray) -> None:
-        if self.center is not None:
+    def _set_axes(self, points_m: np.ndarray) -> None:
+        if self.center is not None and not self.follow_pelvis:
             return
         pelvis = _midpoint(points_m, "left_hip", "right_hip")
         if not _finite_point(pelvis):
@@ -317,7 +319,7 @@ class SkeletonViewer:
     def update(self, points_m: np.ndarray, title: str) -> None:
         if not self.is_open():
             return
-        self._lock_axes(points_m)
+        self._set_axes(points_m)
         colors = []
         for index in range(points_m.shape[0]):
             if index in {11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31}:
@@ -357,7 +359,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--viewer", dest="viewer", action="store_true", default=True)
     parser.add_argument("--no-viewer", dest="viewer", action="store_false")
     parser.add_argument("--viewer-range-m", type=float, default=3.0)
+    parser.add_argument("--viewer-follow-pelvis", dest="viewer_follow_pelvis", action="store_true", default=True)
+    parser.add_argument("--viewer-lock-first-valid", dest="viewer_follow_pelvis", action="store_false")
     parser.add_argument("--print-every-frames", type=int, default=30)
+    parser.add_argument("--start-when-valid", dest="start_when_valid", action="store_true", default=True)
+    parser.add_argument("--no-start-when-valid", dest="start_when_valid", action="store_false")
+    parser.add_argument("--start-valid-2d-ratio", type=float, default=0.95)
+    parser.add_argument("--start-stable-frames", type=int, default=5)
     parser.add_argument("--low-valid-2d-ratio", type=float, default=0.75)
     parser.add_argument("--max-bone-length-change-m", type=float, default=0.20)
     parser.add_argument("--max-jitter-speed-mps", type=float, default=5.0)
@@ -409,6 +417,7 @@ def main() -> None:
     args = parser.parse_args()
     output_folder = (args.output_folder or _default_output_folder()).expanduser().resolve()
     output_folder.mkdir(parents=True, exist_ok=True)
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
     latest_source_diagnostics: Dict[str, Any] = {}
 
@@ -416,16 +425,24 @@ def main() -> None:
         latest_source_diagnostics.clear()
         latest_source_diagnostics.update(diagnostics)
 
-    viewer = SkeletonViewer(args.viewer_range_m) if args.viewer else None
+    viewer = SkeletonViewer(args.viewer_range_m, follow_pelvis=args.viewer_follow_pelvis) if args.viewer else None
     points_history: list[np.ndarray] = []
     metrics_history: list[Dict[str, Any]] = []
     previous_points_m: Optional[np.ndarray] = None
     previous_timestamp_ns: Optional[int] = None
     previous_bone_lengths: Optional[Dict[str, Optional[float]]] = None
     wall_start = time.perf_counter()
+    recording_started = not bool(args.start_when_valid)
+    valid_start_streak = 0
 
     diagnostics_jsonl_path = output_folder / "diagnostics.jsonl"
     print(f"Skellycam mocap diagnostics starting. Output: {output_folder}", flush=True)
+    if args.start_when_valid:
+        print(
+            "Waiting for a valid person before counting diagnostic frames "
+            f"(valid2d>={args.start_valid_2d_ratio}, stable_frames={args.start_stable_frames}).",
+            flush=True,
+        )
     try:
         with diagnostics_jsonl_path.open("w", encoding="utf-8") as diagnostics_file:
             for frame in iter_skellycam_mocap_3d_frames(
@@ -433,7 +450,7 @@ def main() -> None:
                 camera_ids=args.camera_ids,
                 camera_config_json=args.camera_config_json,
                 skellycam_home=args.skellycam_home,
-                max_frames=args.max_frames,
+                max_frames=None if args.start_when_valid else args.max_frames,
                 model_complexity=args.model_complexity,
                 tracker=args.tracker,
                 parallel_camera_tracking=args.parallel_camera_tracking,
@@ -456,6 +473,40 @@ def main() -> None:
                     previous_bone_lengths=previous_bone_lengths,
                     args=args,
                 )
+                if not recording_started:
+                    has_valid_3d = int(metrics["nan_3d_point_count"]) == 0
+                    has_valid_2d = float(metrics["valid_2d_point_ratio"]) >= float(args.start_valid_2d_ratio)
+                    if has_valid_2d and has_valid_3d:
+                        valid_start_streak += 1
+                    else:
+                        valid_start_streak = 0
+
+                    if viewer is not None and viewer.is_open() and has_valid_3d:
+                        viewer.update(
+                            points_m,
+                            title=(
+                                f"waiting seq={frame.seq} valid2d={frame.valid_2d_point_ratio * 100.0:.1f}% "
+                                f"streak={valid_start_streak}/{args.start_stable_frames}"
+                            ),
+                        )
+                    if frame.seq == 0 or frame.seq % max(1, args.print_every_frames) == 0:
+                        print(
+                            "[MocapDiagWaiting] "
+                            f"seq={frame.seq} valid2d={frame.valid_2d_point_ratio * 100.0:.1f}% "
+                            f"nan3d={metrics['nan_3d_point_count']} "
+                            f"streak={valid_start_streak}/{args.start_stable_frames}",
+                            flush=True,
+                        )
+                    if valid_start_streak < int(args.start_stable_frames):
+                        continue
+
+                    recording_started = True
+                    wall_start = time.perf_counter()
+                    previous_points_m = None
+                    previous_timestamp_ns = None
+                    previous_bone_lengths = None
+                    print(f"[MocapDiagStarted] seq={frame.seq}", flush=True)
+
                 elapsed_s = max(time.perf_counter() - wall_start, 1e-6)
                 metrics["mocap_fps"] = float((len(metrics_history) + 1) / elapsed_s)
                 points_history.append(points_m.astype(np.float32, copy=True))
@@ -486,6 +537,8 @@ def main() -> None:
                         f"flags={','.join(metrics['flags']) or 'ok'}",
                         flush=True,
                     )
+                if args.max_frames is not None and len(metrics_history) >= int(args.max_frames):
+                    break
     except KeyboardInterrupt:
         print("Diagnostics interrupted; saving collected frames.", flush=True)
     finally:
