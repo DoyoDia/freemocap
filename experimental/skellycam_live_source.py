@@ -137,14 +137,18 @@ def _build_camera_config_dictionary(
 
 
 def frames_are_synchronized(frame_payloads: Sequence[Any], max_camera_skew_ms: float) -> bool:
+    skew_ms = camera_timestamp_skew_ms(frame_payloads)
+    return skew_ms is not None and skew_ms <= max_camera_skew_ms
+
+
+def camera_timestamp_skew_ms(frame_payloads: Sequence[Any]) -> Optional[float]:
     timestamps = [getattr(frame, "timestamp_ns", None) for frame in frame_payloads]
     if any(timestamp is None for timestamp in timestamps):
-        return False
+        return None
     timestamp_array = np.asarray(timestamps, dtype=np.float64)
     if not np.isfinite(timestamp_array).all():
-        return False
-    skew_ms = float((np.max(timestamp_array) - np.min(timestamp_array)) / 1e6)
-    return skew_ms <= max_camera_skew_ms
+        return None
+    return float((np.max(timestamp_array) - np.min(timestamp_array)) / 1e6)
 
 
 def _payloads_to_frames_and_sizes(frame_payloads: Sequence[Any]) -> tuple[List[np.ndarray], List[tuple[int, int]]]:
@@ -188,8 +192,10 @@ def _track_and_triangulate_frame_set(
     parallel_camera_tracking: bool,
     camera_executor: Optional[ThreadPoolExecutor],
     include_holistic: bool = False,
-) -> tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float, Dict[str, Any]]:
+    total_start = time.perf_counter()
     tracking_frames, tracking_image_sizes, scale_factors = resize_frames_for_tracking(frames, resize_width)
+    tracking_start = time.perf_counter()
     if parallel_camera_tracking:
         if camera_executor is None:
             raise RuntimeError("camera_executor is required when parallel_camera_tracking=True")
@@ -212,15 +218,27 @@ def _track_and_triangulate_frame_set(
                 scale_factors,
             )
         ]
+    tracking_end = time.perf_counter()
 
     tracked_frame = np.stack(per_camera_2d, axis=0)
     if tracker == "holistic" and not include_holistic:
         tracked_frame = tracked_frame[:, :33, :]
 
-    valid_ratio = float(np.isfinite(tracked_frame[..., :2]).all(axis=-1).mean())
+    valid_points = np.isfinite(tracked_frame[..., :2]).all(axis=-1)
+    valid_ratio = float(valid_points.mean())
+    per_camera_valid_ratios = valid_points.mean(axis=1).astype(np.float32)
     points_2d = tracked_frame[:, :, :2].reshape(len(image_sizes), -1, 2)
+    triangulate_start = time.perf_counter()
     points_3d = calibration.triangulate(points_2d, progress=False).reshape(tracked_frame.shape[1], 3)
-    return points_3d.astype(np.float32, copy=False), valid_ratio
+    triangulate_end = time.perf_counter()
+    diagnostics = {
+        "points_2d": points_2d.astype(np.float32, copy=False),
+        "per_camera_2d_valid_ratios": per_camera_valid_ratios,
+        "tracking_ms": (tracking_end - tracking_start) * 1000.0,
+        "triangulate_3d_ms": (triangulate_end - triangulate_start) * 1000.0,
+        "total_ms": (triangulate_end - total_start) * 1000.0,
+    }
+    return points_3d.astype(np.float32, copy=False), valid_ratio, diagnostics
 
 
 def iter_skellycam_mocap_3d_frames(
@@ -240,6 +258,7 @@ def iter_skellycam_mocap_3d_frames(
     max_camera_skew_ms: float = DEFAULT_MAX_CAMERA_SKEW_MS,
     poll_sleep_s: float = 0.001,
     skellycam_importer: Callable[[Optional[Path]], tuple[type, type]] = _import_skellycam_bits,
+    diagnostics_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Iterator[MocapFrame]:
     if max_frames is not None and max_frames <= 0:
         raise ValueError("max_frames must be positive when provided")
@@ -296,12 +315,13 @@ def iter_skellycam_mocap_3d_frames(
                 continue
 
             ordered_payloads = [latest_by_camera[camera_id] for camera_id in ordered_camera_ids]
-            if not frames_are_synchronized(ordered_payloads, max_camera_skew_ms=max_camera_skew_ms):
+            camera_skew_ms = camera_timestamp_skew_ms(ordered_payloads)
+            if camera_skew_ms is None or camera_skew_ms > max_camera_skew_ms:
                 time.sleep(poll_sleep_s)
                 continue
 
             frames, image_sizes = _payloads_to_frames_and_sizes(ordered_payloads)
-            points_3d, valid_ratio = _track_and_triangulate_frame_set(
+            points_3d, valid_ratio, tracking_diagnostics = _track_and_triangulate_frame_set(
                 frames=frames,
                 image_sizes=image_sizes,
                 trackers=trackers,
@@ -312,9 +332,26 @@ def iter_skellycam_mocap_3d_frames(
                 camera_executor=camera_executor,
                 include_holistic=include_holistic,
             )
+            timestamp_ns = int(max(float(getattr(payload, "timestamp_ns")) for payload in ordered_payloads))
+            if diagnostics_callback is not None:
+                diagnostics_callback(
+                    {
+                        "seq": int(seq),
+                        "timestamp_ns": timestamp_ns,
+                        "camera_ids": list(ordered_camera_ids),
+                        "camera_timestamps_ns": [
+                            int(float(getattr(payload, "timestamp_ns"))) for payload in ordered_payloads
+                        ],
+                        "camera_skew_ms": float(camera_skew_ms),
+                        "image_sizes": list(image_sizes),
+                        "valid_2d_point_ratio": float(valid_ratio),
+                        "points_3d": points_3d,
+                        **tracking_diagnostics,
+                    }
+                )
             yield MocapFrame(
                 seq=seq,
-                timestamp_ns=int(max(float(getattr(payload, "timestamp_ns")) for payload in ordered_payloads)),
+                timestamp_ns=timestamp_ns,
                 points_3d=points_3d,
                 valid_2d_point_ratio=valid_ratio,
             )

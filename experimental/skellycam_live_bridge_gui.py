@@ -123,8 +123,11 @@ TRANSLATIONS = {
         "control_bind": "控制地址",
         "start_bridge": "启动实时桥",
         "stop_bridge": "停止实时桥",
+        "start_diagnostics": "诊断双相机 3D",
+        "stop_diagnostics": "停止诊断",
         "status": "状态",
         "stopped": "实时桥已停止。",
+        "diagnostics_starting": "双相机 3D 诊断启动中...",
         "starting": "实时桥启动中...",
         "select_toml_title": "选择相机标定 TOML",
         "toml_missing": "标定 TOML 不存在：{path}",
@@ -132,6 +135,10 @@ TRANSLATIONS = {
         "preview_close_warning": "警告：关闭预览相机失败：{error}",
         "bridge_command": "启动实时桥：{command}",
         "bridge_finished": "实时桥进程已结束。",
+        "diagnostics_command": "启动双相机 3D 诊断：{command}",
+        "diagnostics_finished": "双相机 3D 诊断进程已结束。",
+        "diagnostics_running": "诊断已经在运行啦，先停止当前诊断喵。",
+        "bridge_running_block_diagnostics": "实时桥正在运行。请先停止实时桥，再诊断双相机 3D。",
         "bridge_running_block_calibration": "实时桥正在运行。请先停止实时桥，再录制标定视频。",
         "cameras_not_connected": "相机还没有连接。请先点击 skellycam 的 Detect Available Cameras。",
         "settings_loaded": "已读取上次配置：{path}",
@@ -191,8 +198,11 @@ TRANSLATIONS = {
         "control_bind": "Control bind",
         "start_bridge": "Start Bridge",
         "stop_bridge": "Stop Bridge",
+        "start_diagnostics": "Diagnose 2-Camera 3D",
+        "stop_diagnostics": "Stop Diagnostics",
         "status": "Status",
         "stopped": "Bridge stopped.",
+        "diagnostics_starting": "2-camera 3D diagnostics starting...",
         "starting": "Bridge starting...",
         "select_toml_title": "Select camera calibration TOML",
         "toml_missing": "Calibration TOML does not exist: {path}",
@@ -200,6 +210,10 @@ TRANSLATIONS = {
         "preview_close_warning": "Warning: could not close preview cameras cleanly: {error}",
         "bridge_command": "Starting bridge: {command}",
         "bridge_finished": "Bridge process finished.",
+        "diagnostics_command": "Starting 2-camera 3D diagnostics: {command}",
+        "diagnostics_finished": "2-camera 3D diagnostics process finished.",
+        "diagnostics_running": "Diagnostics is already running. Stop the current diagnostics process first.",
+        "bridge_running_block_diagnostics": "Bridge is running. Stop it before diagnosing 2-camera 3D.",
         "bridge_running_block_calibration": "Bridge is running. Stop it before recording calibration videos.",
         "cameras_not_connected": "Cameras are not connected. Click skellycam's Detect Available Cameras first.",
         "settings_loaded": "Loaded previous settings: {path}",
@@ -272,6 +286,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self.resize(1280, 860)
 
         self._bridge_process: Optional[QProcess] = None
+        self._diagnostics_process: Optional[QProcess] = None
         self._calibration_worker: Optional[AniposeCalibrationThreadWorker] = None
         self._groundplane_worker: Optional[GroundplaneCalibrationThreadWorker] = None
         self._kill_thread_event = threading.Event()
@@ -498,6 +513,16 @@ class SkellycamLiveBridgeLauncher(QWidget):
         button_row.addWidget(self._stop_button)
         form.addRow("", button_row)
 
+        diagnostics_button_row = QHBoxLayout()
+        self._start_diagnostics_button = QPushButton()
+        self._stop_diagnostics_button = QPushButton()
+        self._stop_diagnostics_button.setEnabled(False)
+        self._start_diagnostics_button.clicked.connect(self._start_diagnostics)
+        self._stop_diagnostics_button.clicked.connect(self._stop_diagnostics)
+        diagnostics_button_row.addWidget(self._start_diagnostics_button)
+        diagnostics_button_row.addWidget(self._stop_diagnostics_button)
+        form.addRow("", diagnostics_button_row)
+
         self._status_label_text = QLabel()
         self._status_label = QLabel()
         self._status_label.setWordWrap(True)
@@ -549,8 +574,10 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._control_bind_label.setText(self._tr("control_bind"))
         self._start_button.setText(self._tr("start_bridge"))
         self._stop_button.setText(self._tr("stop_bridge"))
+        self._start_diagnostics_button.setText(self._tr("start_diagnostics"))
+        self._stop_diagnostics_button.setText(self._tr("stop_diagnostics"))
         self._status_label_text.setText(self._tr("status"))
-        if self._bridge_process is None:
+        if self._bridge_process is None and self._diagnostics_process is None:
             self._status_label.setText(self._tr("stopped"))
 
     def _handle_language_changed(self, *_args) -> None:
@@ -954,6 +981,9 @@ class SkellycamLiveBridgeLauncher(QWidget):
         self._append_log(self._tr("groundplane_failed", message=message))
 
     def _start_bridge(self) -> None:
+        if self._diagnostics_process is not None:
+            self._append_log(self._tr("diagnostics_running"))
+            return
         calibration_toml = Path(self._calibration_line_edit.text()).expanduser()
         if not calibration_toml.exists():
             self._append_log(self._tr("toml_missing", path=calibration_toml))
@@ -1030,8 +1060,73 @@ class SkellycamLiveBridgeLauncher(QWidget):
 
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(True)
+        self._start_diagnostics_button.setEnabled(False)
         self._status_label.setText(self._tr("starting"))
         self._append_log(self._tr("bridge_command", command=f"{sys.executable} {' '.join(args)}"))
+
+    def _start_diagnostics(self) -> None:
+        if self._bridge_process is not None:
+            self._append_log(self._tr("bridge_running_block_diagnostics"))
+            return
+        if self._diagnostics_process is not None:
+            self._append_log(self._tr("diagnostics_running"))
+            return
+
+        calibration_toml = Path(self._calibration_line_edit.text()).expanduser()
+        if not calibration_toml.exists():
+            self._append_log(self._tr("toml_missing", path=calibration_toml))
+            return
+
+        configs = self._extract_camera_configs()
+        camera_ids = self._selected_camera_ids(configs)
+        if not camera_ids:
+            self._append_log(self._tr("no_cameras_selected"))
+            return
+
+        self._save_gui_settings(log_success=True)
+        self._write_camera_config_json(configs)
+        try:
+            self._camera_viewer.disconnect_from_cameras()
+        except Exception as exc:
+            self._append_log(self._tr("preview_close_warning", error=exc))
+
+        args = [
+            "-u",
+            str(REPO_ROOT / "experimental" / "skellycam_mocap_diagnostics.py"),
+            "--calibration-toml",
+            str(calibration_toml),
+            "--camera-ids",
+            ",".join(camera_ids),
+            "--camera-config-json",
+            str(self._camera_config_json_path),
+            "--skellycam-home",
+            str(RUNTIME_HOME),
+            "--tracker",
+            "pose",
+            "--model-complexity",
+            str(self._model_complexity_spin.value()),
+            "--max-camera-skew-ms",
+            str(self._max_camera_skew_spin.value()),
+            "--max-frames",
+            "900",
+        ]
+        if self._parallel_tracking_checkbox.isChecked():
+            args.append("--parallel-camera-tracking")
+
+        self._diagnostics_process = QProcess(self)
+        self._diagnostics_process.setWorkingDirectory(str(REPO_ROOT))
+        self._diagnostics_process.setProgram(sys.executable)
+        self._diagnostics_process.setArguments(args)
+        self._diagnostics_process.readyReadStandardOutput.connect(self._handle_diagnostics_stdout)
+        self._diagnostics_process.readyReadStandardError.connect(self._handle_diagnostics_stderr)
+        self._diagnostics_process.finished.connect(lambda *_: self._handle_diagnostics_finished())
+        self._diagnostics_process.start()
+
+        self._start_diagnostics_button.setEnabled(False)
+        self._stop_diagnostics_button.setEnabled(True)
+        self._start_button.setEnabled(False)
+        self._status_label.setText(self._tr("diagnostics_starting"))
+        self._append_log(self._tr("diagnostics_command", command=f"{sys.executable} {' '.join(args)}"))
 
     def _stop_bridge(self) -> None:
         if self._bridge_process is None:
@@ -1040,6 +1135,14 @@ class SkellycamLiveBridgeLauncher(QWidget):
         if not self._bridge_process.waitForFinished(3000):
             self._bridge_process.kill()
             self._bridge_process.waitForFinished(1000)
+
+    def _stop_diagnostics(self) -> None:
+        if self._diagnostics_process is None:
+            return
+        self._diagnostics_process.terminate()
+        if not self._diagnostics_process.waitForFinished(3000):
+            self._diagnostics_process.kill()
+            self._diagnostics_process.waitForFinished(1000)
 
     def _handle_stdout(self) -> None:
         if self._bridge_process is None:
@@ -1057,12 +1160,37 @@ class SkellycamLiveBridgeLauncher(QWidget):
         for line in text.splitlines():
             self._append_log(line)
 
+    def _handle_diagnostics_stdout(self) -> None:
+        if self._diagnostics_process is None:
+            return
+        text = bytes(self._diagnostics_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            self._append_log(line)
+            if line.startswith("[MocapDiagStats]"):
+                self._status_label.setText(line)
+
+    def _handle_diagnostics_stderr(self) -> None:
+        if self._diagnostics_process is None:
+            return
+        text = bytes(self._diagnostics_process.readAllStandardError()).decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            self._append_log(line)
+
     def _handle_bridge_finished(self) -> None:
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
+        self._start_diagnostics_button.setEnabled(True)
         self._status_label.setText(self._tr("stopped"))
         self._append_log(self._tr("bridge_finished"))
         self._bridge_process = None
+
+    def _handle_diagnostics_finished(self) -> None:
+        self._start_diagnostics_button.setEnabled(True)
+        self._stop_diagnostics_button.setEnabled(False)
+        self._start_button.setEnabled(True)
+        self._status_label.setText(self._tr("stopped"))
+        self._append_log(self._tr("diagnostics_finished"))
+        self._diagnostics_process = None
 
     def _append_log(self, text: str) -> None:
         self._log_view.appendPlainText(text)
@@ -1070,6 +1198,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
     def closeEvent(self, event) -> None:
         self._save_gui_settings()
         self._stop_bridge()
+        self._stop_diagnostics()
         self._kill_thread_event.set()
         try:
             self._camera_viewer.close()
