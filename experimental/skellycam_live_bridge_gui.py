@@ -36,16 +36,12 @@ from PySide6.QtWidgets import (
 
 from skellycam_live_source import configure_skellycam_runtime_home
 from gmr_runtime import validate_gmr_runtime
-from groundplane_only_calibration import apply_groundplane_to_calibration_toml
 from skellycam_preview_latency_patch import install_latest_frame_preview_patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_HOME = configure_skellycam_runtime_home(REPO_ROOT / ".venv" / ".skellycam_live_gui_home")
 GUI_SETTINGS_PATH = RUNTIME_HOME / "live_bridge_gui_settings.json"
 GUI_SETTINGS_VERSION = 1
-
-from freemocap.core_processes.capture_volume_calibration.charuco_stuff.charuco_board_definition import CHARUCO_BOARDS
-from freemocap.gui.qt.workers.anipose_calibration_thread_worker import AniposeCalibrationThreadWorker
 
 from skellycam import CameraConfig, SkellyCamParameterTreeWidget, SkellyCamWidget
 
@@ -72,6 +68,8 @@ class GroundplaneCalibrationThreadWorker(QThread):
 
     def run(self) -> None:
         try:
+            from groundplane_only_calibration import apply_groundplane_to_calibration_toml
+
             result = apply_groundplane_to_calibration_toml(
                 calibration_toml=self._calibration_toml,
                 calibration_videos_folder=self._calibration_videos_folder,
@@ -160,6 +158,9 @@ TRANSLATIONS = {
         "groundplane_requires_toml": "请先选择一个已经成功的相机标定 TOML，再只重标定地面。",
         "groundplane_failed": "地面原点标定失败：{message}",
         "runtime_not_ready": "GMR / MuJoCo 运行时环境未就绪：{error}",
+        "try_camera_orders": "自动测试相机顺序",
+        "try_rotation_variants": "自动测试旋转配置",
+        "diagnostics_ransac": "RANSAC 三角重建",
     },
     "en": {
         "window_title": "Skellycam Live FreeMoCap -> GMR Bridge",
@@ -282,6 +283,14 @@ def _create_live_calibration_recording_folder() -> Path:
     return recording_folder
 
 
+def _load_charuco_boards() -> dict[str, Any]:
+    from freemocap.core_processes.capture_volume_calibration.charuco_stuff.charuco_board_definition import (
+        CHARUCO_BOARDS,
+    )
+
+    return CHARUCO_BOARDS
+
+
 class SkellycamLiveBridgeLauncher(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -290,7 +299,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
 
         self._bridge_process: Optional[QProcess] = None
         self._diagnostics_process: Optional[QProcess] = None
-        self._calibration_worker: Optional[AniposeCalibrationThreadWorker] = None
+        self._calibration_worker: Optional[QThread] = None
         self._groundplane_worker: Optional[GroundplaneCalibrationThreadWorker] = None
         self._kill_thread_event = threading.Event()
         self._camera_config_json_path = RUNTIME_HOME / "live_bridge_camera_configs.json"
@@ -345,6 +354,35 @@ class SkellycamLiveBridgeLauncher(QWidget):
         template = language_table.get(key, TRANSLATIONS["en"].get(key, key))
         return template.format(**kwargs) if kwargs else template
 
+    def _localize_status_line(self, text: str) -> str:
+        if self._language != "zh":
+            return text
+
+        replacements = [
+            ("[MocapDiagStats]", "[诊断统计]"),
+            ("[MocapDiagWaiting]", "[等待有效人体]"),
+            ("[MocapDiagStarted]", "[开始诊断]"),
+            ("[MocapDiagRecommend]", "[诊断建议]"),
+            ("[MocapDiagWarning]", "[诊断警告]"),
+            ("[MocapDiagSetup]", "[诊断配置]"),
+            ("[MocapDiagPreflight]", "[诊断预检]"),
+            ("[MocapDiagPreflightWaiting]", "[预检等待]"),
+            ("recommended_order=", "推荐顺序="),
+            ("valid2d=", "有效2D="),
+            ("reproj=", "重投影="),
+            ("height=", "身高="),
+            ("last=", "问题="),
+            ("flags=", "标记="),
+            ("score=", "评分="),
+            ("rotations=", "旋转="),
+            ("order=", "顺序="),
+            ("waiting_", "等待_"),
+        ]
+        localized = text
+        for source, target in replacements:
+            localized = localized.replace(source, target)
+        return localized
+
     def _build_language_controls(self) -> None:
         self._language_group = QGroupBox()
         self._right_column.addWidget(self._language_group)
@@ -373,7 +411,7 @@ class SkellycamLiveBridgeLauncher(QWidget):
 
         self._charuco_board_label = QLabel()
         self._charuco_board_combo = QComboBox()
-        self._charuco_board_combo.addItems(list(CHARUCO_BOARDS.keys()))
+        self._charuco_board_combo.addItems(list(_load_charuco_boards().keys()))
         self._charuco_board_combo.currentTextChanged.connect(self._set_preview_charuco_board)
         form.addRow(self._charuco_board_label, self._charuco_board_combo)
 
@@ -936,7 +974,9 @@ class SkellycamLiveBridgeLauncher(QWidget):
             return
 
         board_name = self._charuco_board_combo.currentText()
-        charuco_board_definition = CHARUCO_BOARDS[board_name]()
+        from freemocap.gui.qt.workers.anipose_calibration_thread_worker import AniposeCalibrationThreadWorker
+
+        charuco_board_definition = _load_charuco_boards()[board_name]()
         self._calibration_worker = AniposeCalibrationThreadWorker(
             calibration_videos_folder_path=self._active_calibration_videos_folder,
             charuco_square_size=float(self._charuco_square_size_spin.value()),
@@ -1200,9 +1240,10 @@ class SkellycamLiveBridgeLauncher(QWidget):
             return
         text = bytes(self._diagnostics_process.readAllStandardOutput()).decode("utf-8", errors="replace")
         for line in text.splitlines():
-            self._append_log(line)
+            localized_line = self._localize_status_line(line)
+            self._append_log(localized_line)
             if line.startswith("[MocapDiag"):
-                self._status_label.setText(line)
+                self._status_label.setText(localized_line)
 
     def _handle_diagnostics_stderr(self) -> None:
         if self._diagnostics_process is None:

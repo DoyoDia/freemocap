@@ -34,6 +34,34 @@ SUPPORTED_TRIANGULATE_METHODS = ("simple", "ransac")
 SUPPORTED_ROTATION_DEGREES = (0, 90, 180, 270)
 
 
+def _prepend_experimental_path_for_spawned_processes() -> None:
+    experimental_path = str(Path(__file__).resolve().parent)
+    if experimental_path not in sys.path:
+        sys.path.insert(0, experimental_path)
+
+    pythonpath_parts = [
+        part
+        for part in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+        if part
+    ]
+    if experimental_path not in pythonpath_parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([experimental_path, *pythonpath_parts])
+
+
+def install_skellycam_runtime_patches() -> None:
+    _prepend_experimental_path_for_spawned_processes()
+    try:
+        from skellycam_capture_config_patch import install_skellycam_capture_config_patch
+
+        install_skellycam_capture_config_patch()
+    except Exception:
+        logging = __import__("logging")
+        logging.getLogger(__name__).debug(
+            "Could not install skellycam runtime patches in this process",
+            exc_info=True,
+        )
+
+
 def choose_skellycam_runtime_home(skellycam_home: Optional[Path] = None) -> Path:
     candidates = [
         skellycam_home.expanduser() if skellycam_home is not None else None,
@@ -58,6 +86,7 @@ def configure_skellycam_runtime_home(skellycam_home: Optional[Path] = None) -> P
     os.environ["HOME"] = str(runtime_home)
     os.environ["USERPROFILE"] = str(runtime_home)
     os.environ.setdefault("YOLO_CONFIG_DIR", str(runtime_home))
+    install_skellycam_runtime_patches()
     return runtime_home
 
 
