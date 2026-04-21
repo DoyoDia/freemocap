@@ -191,6 +191,27 @@ def test_validate_gmr_runtime_import_error_mentions_install_command(monkeypatch,
         gmr_runtime.validate_gmr_runtime(tmp_path, require_mujoco=False, require_patch=False)
 
 
+def test_validate_gmr_runtime_native_init_error_is_wrapped(monkeypatch, tmp_path: Path) -> None:
+    gmr_root = tmp_path / "external" / "GMR"
+    unitree_xml = gmr_root / "assets" / "unitree_g1" / "g1_mocap_29dof.xml"
+    unitree_xml.parent.mkdir(parents=True)
+    unitree_xml.write_text("<mujoco/>", encoding="utf-8")
+
+    original_import_module = gmr_runtime.importlib.import_module
+
+    def _fake_import_module(name: str):
+        if name == "general_motion_retargeting":
+            raise OSError("[WinError 1114] dll init failed")
+        return original_import_module(name)
+
+    monkeypatch.setattr(gmr_runtime.importlib, "import_module", _fake_import_module)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="Failed to initialize general_motion_retargeting"):
+        gmr_runtime.validate_gmr_runtime(tmp_path, require_mujoco=False, require_patch=False)
+
+
 def test_validate_gmr_runtime_can_skip_gmr_import(monkeypatch, tmp_path: Path) -> None:
     gmr_root = tmp_path / "external" / "GMR"
     unitree_xml = gmr_root / "assets" / "unitree_g1" / "g1_mocap_29dof.xml"

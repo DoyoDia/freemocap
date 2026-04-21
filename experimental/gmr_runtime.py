@@ -93,6 +93,12 @@ def validate_gmr_runtime(
                 "Install the package into the active environment with "
                 "'python -m pip install -e external/GMR'."
             ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to initialize general_motion_retargeting from {gmr_root}: {exc}. "
+                "This usually means a dependent native runtime such as MuJoCo, Mink, or a DLL/plugin "
+                "failed to initialize inside the current process."
+            ) from exc
 
     if require_mujoco:
         try:
@@ -101,6 +107,11 @@ def validate_gmr_runtime(
             raise RuntimeError(
                 f"Failed to import mujoco: {exc}. Install it into the active environment before "
                 "starting the MuJoCo viewer."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to initialize mujoco: {exc}. A MuJoCo DLL or bundled plugin likely failed to "
+                "initialize in the current process."
             ) from exc
 
     unitree_g1_xml = gmr_root / "assets" / "unitree_g1" / "g1_mocap_29dof.xml"

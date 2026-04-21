@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from PySide6.QtCore import QProcess, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -34,7 +34,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from skellycam_live_source import configure_skellycam_runtime_home
+from skellycam_live_source import (
+    SKELLYCAM_CAPTURE_PATCH_STARTUP_ENV,
+    configure_skellycam_runtime_home,
+)
 from gmr_runtime import validate_gmr_runtime
 from skellycam_preview_latency_patch import install_latest_frame_preview_patch
 
@@ -1115,6 +1118,9 @@ class SkellycamLiveBridgeLauncher(QWidget):
             )
 
         self._bridge_process = QProcess(self)
+        bridge_env = QProcessEnvironment.systemEnvironment()
+        bridge_env.insert(SKELLYCAM_CAPTURE_PATCH_STARTUP_ENV, "0")
+        self._bridge_process.setProcessEnvironment(bridge_env)
         self._bridge_process.setWorkingDirectory(str(REPO_ROOT))
         self._bridge_process.setProgram(sys.executable)
         self._bridge_process.setArguments(args)

@@ -24,7 +24,10 @@ import numpy as np
 
 from gmr_runtime import ensure_gmr_paths, validate_gmr_runtime
 from realtime_mocap_probe import iter_mocap_3d_frames
-from skellycam_live_source import iter_skellycam_mocap_3d_frames
+from skellycam_live_source import (
+    iter_skellycam_mocap_3d_frames,
+    set_skellycam_capture_patch_startup_enabled,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ensure_gmr_paths(REPO_ROOT)
@@ -684,6 +687,9 @@ class FreeMoCapToGMRBridge:
         self._logged_first_retarget_frame = False
 
     def _validate_runtime_prerequisites(self) -> None:
+        # Retarget/viewer worker subprocesses must not auto-import skellycam at
+        # interpreter startup, or MuJoCo DLL initialization can fail on Windows.
+        set_skellycam_capture_patch_startup_enabled(False)
         needs_gmr_runtime = bool(self.args.mujoco_viewer) or not bool(self.args.mock_gmr)
         if not needs_gmr_runtime:
             return

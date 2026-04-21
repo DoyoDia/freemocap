@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MAX_CAMERA_SKEW_MS = 50.0
 SUPPORTED_TRIANGULATE_METHODS = ("simple", "ransac")
 SUPPORTED_ROTATION_DEGREES = (0, 90, 180, 270)
+SKELLYCAM_CAPTURE_PATCH_STARTUP_ENV = "FREEMOCAP_SKELLYCAM_CAPTURE_PATCH_AT_STARTUP"
 
 
 def _prepend_experimental_path_for_spawned_processes() -> None:
@@ -48,8 +49,13 @@ def _prepend_experimental_path_for_spawned_processes() -> None:
         os.environ["PYTHONPATH"] = os.pathsep.join([experimental_path, *pythonpath_parts])
 
 
+def set_skellycam_capture_patch_startup_enabled(enabled: bool) -> None:
+    os.environ[SKELLYCAM_CAPTURE_PATCH_STARTUP_ENV] = "1" if enabled else "0"
+
+
 def install_skellycam_runtime_patches() -> None:
     _prepend_experimental_path_for_spawned_processes()
+    set_skellycam_capture_patch_startup_enabled(True)
     try:
         from skellycam_capture_config_patch import install_skellycam_capture_config_patch
 
